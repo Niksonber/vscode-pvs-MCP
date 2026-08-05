@@ -111,6 +111,26 @@ export class EventsDispatcher {
     protected pvsFailureHandlers: Array<(params: any) => void> = [];
     protected pathEvaluator: VSCodePvsPathEvaluator;
 
+    protected proofCommandResponseListeners: Array<(desc: ProofCommandResponse) => void> = [];
+
+    public addProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void) {
+        this.proofCommandResponseListeners.push(cb);
+    }
+
+    public removeProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void) {
+        this.proofCommandResponseListeners = this.proofCommandResponseListeners.filter(l => l !== cb);
+    }
+
+    protected proveFormulaResponseListeners: Array<(desc: ProveFormulaResponse) => void> = [];
+
+    public addProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void) {
+        this.proveFormulaResponseListeners.push(cb);
+    }
+
+    public removeProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void) {
+        this.proveFormulaResponseListeners = this.proveFormulaResponseListeners.filter(l => l !== cb);
+    }
+
     constructor (client: LanguageClient, handlers: {
         statusBar: VSCodePvsStatusBar,
         emacsBindings: VSCodePvsEmacsBindingsProvider,
@@ -325,6 +345,14 @@ export class EventsDispatcher {
                 // update proof mate
                 this.proofMate.updateRecommendations(desc.res);
             }
+            // Trigger listeners
+            this.proofCommandResponseListeners.forEach(listener => {
+                try {
+                    listener(desc);
+                } catch (e) {
+                    console.error("Error in proofCommandResponseListener", e);
+                }
+            });
         });
 
         //----------------
@@ -575,6 +603,13 @@ export class EventsDispatcher {
             //     // this.proofExplorer.startProof();
             //     this.proofMate.startProof();                
             // }
+            this.proveFormulaResponseListeners.forEach(listener => {
+                try {
+                    listener(desc);
+                } catch (e) {
+                    console.error("Error in proveFormulaResponseListener", e);
+                }
+            });
         });
 
         this.client.onRequest(serverEvent.pvsServerFail, (desc: { msg?: string }) => {

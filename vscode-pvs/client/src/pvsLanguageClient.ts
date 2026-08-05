@@ -63,6 +63,7 @@ import { VSCodePvsXTerm } from './views/vscodePvsXTerm';
 import { XTermColorTheme } from './common/colorUtils';
 import { getActivePvsEditor, registerDevContainerCommands, setDevContainerConfig, setRuntimeEnvContext } from './utils/vscode-utils';
 import { VSCodePvsFileViewer } from './views/vscodePvsFileViewer';
+import { McpHttpServer } from './mcpHttpServer';
 import { VSCodePvsPathEvaluator } from './views/vscodePvsPathEvaluator';
 
 const server_path: string = path.join('server', 'out', 'pvsLanguageServer.js');
@@ -108,6 +109,9 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 
 	// events dispatcher
 	protected eventsDispatcher: EventsDispatcher;
+
+	// mcp http server
+	protected mcpHttpServer: McpHttpServer;
 
 	// package manager
 	protected packageManager: VSCodePvsPackageManager;
@@ -499,6 +503,9 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 				pathEvaluator: this.pathEvaluator
 			});
 			this.eventsDispatcher.activate(context);
+
+			this.mcpHttpServer = new McpHttpServer(this.eventsDispatcher);
+			this.mcpHttpServer.start();
 			
 			// add default container file to appopriate path in globalStorage if it doesn't exist and add commands for devcontainer
 			try{
@@ -594,6 +601,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 	 * Client stop function
 	 */
 	async stop (): Promise<void> {
+		this.mcpHttpServer?.stop();
 		if (this.client) {
 			this.client.sendRequest(serverRequest.stopPvsServer);
 			await this.client.stop();
