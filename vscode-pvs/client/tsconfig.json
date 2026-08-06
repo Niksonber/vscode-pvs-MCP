@@ -8,6 +8,8 @@
 		"sourceMap": true,
 		"types": [],
 		"strictNullChecks": false,
+		"esModuleInterop": true,
+		"allowSyntheticDefaultImports": true,
 		"typeRoots": [
             "node_modules/@types"
         ]
