@@ -3,8 +3,8 @@
  * @module vscodePvsXTerm
  * @author Paolo Masci
  * @date 2021.03.10
- * @copyright 
- * Copyright 2019 United States Government as represented by the Administrator 
+ * @copyright
+ * Copyright 2019 United States Government as represented by the Administrator
  * of the National Aeronautics and Space Administration. All Rights Reserved.
  *
  * Disclaimers
@@ -38,7 +38,7 @@
  **/
 
 import {
-    Uri, WebviewPanel, ExtensionContext, Terminal, TerminalOptions, 
+    Uri, WebviewPanel, ExtensionContext, Terminal, TerminalOptions,
     ExtensionTerminalOptions, TerminalExitStatus, window, ViewColumn, TextEditor, commands, WebviewPanelOnDidChangeViewStateEvent, TerminalState,
     TerminalShellIntegration
 } from 'vscode';
@@ -49,9 +49,9 @@ import Backbone = require('backbone');
 import * as utils from '../common/languageUtils';
 import { LanguageClient } from 'vscode-languageclient';
 import {
-    EvaluatorCommandResponse, HintsObject, MathObjects, ProofCommandResponse, ProveFormulaRequest, ProveFormulaResponse, 
-    PvsFile, 
-    PvsFormula, PvsioEvaluatorCommand, PvsProofCommand, PvsTheory, PvsProofState, serverEvent, serverRequest 
+    EvaluatorCommandResponse, HintsObject, MathObjects, ProofCommandResponse, ProveFormulaRequest, ProveFormulaResponse,
+    PvsFile,
+    PvsFormula, PvsioEvaluatorCommand, PvsProofCommand, PvsTheory, PvsProofState, serverEvent, serverRequest
 } from '../common/serverInterface';
 import { PvsResponse } from '../common/pvs-gui';
 import * as vscodeUtils from '../utils/vscode-utils';
@@ -191,6 +191,12 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
     // timer for delayed focus
     protected tfocus: NodeJS.Timeout = null;
 
+    protected eventsDispatcher: any = null;
+
+    public setEventsDispatcher (eventsDispatcher: any): void {
+        this.eventsDispatcher = eventsDispatcher;
+    }
+
     // pointer to proof explorer
     protected proofExplorer: VSCodePvsProofExplorer;
 
@@ -222,8 +228,8 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
 
     /**
      * Internal function, adjusts the theory name for tcc formulas
-     * @param theory 
-     * @returns 
+     * @param theory
+     * @returns
      */
     protected matchTccTheory (theory: PvsTheory): void {
         if (theory.fileExtension === ".tccs") {//} && theory.theoryName.endsWith("_TCCS")) {
@@ -380,8 +386,8 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             ...formula
         });
         const success: boolean = await new Promise((resolve, reject) => {
-            this.client.onRequest(serverEvent.proveFormulaResponse, (data: ProveFormulaResponse) => {
-              console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proveFormulaResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+            const onProveFormulaResponse = (data: ProveFormulaResponse) => {
+                console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proveFormulaResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
                 if (this.sessionType) {
                     if (this.prettyPrinter) {
                         const color: colorUtils.PvsColor = colorUtils.getColor(colorUtils.PvsColor.green, this.colorTheme);
@@ -401,15 +407,29 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                         this.log(msg?.trim());
                     }
                 }
+                cleanup();
                 resolve(true);
-            });
-            // The following handler is registered here because proof commands may originate from proof-explorer.
-            // This handler will be replaced by the one in sendText as soon as a sendText is performed.
-            this.client.onRequest(serverEvent.proofCommandResponse, (data: ProofCommandResponse) => {
-              console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
-                // console.log(`[${fsUtils.generateTimestamp()}] `+"[vscode-pvs-xterm] proofCommandResponse", data);
+            };
+
+            const onProofCommandResponse = (data: ProofCommandResponse) => {
+                console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
                 this.onProverResponse(data);
-            });
+            };
+
+            const cleanup = () => {
+                if (this.eventsDispatcher) {
+                    this.eventsDispatcher.removeProveFormulaResponseListener(onProveFormulaResponse);
+                    this.eventsDispatcher.removeProofCommandResponseListener(onProofCommandResponse);
+                }
+            };
+
+            if (this.eventsDispatcher) {
+                this.eventsDispatcher.addProveFormulaResponseListener(onProveFormulaResponse);
+                this.eventsDispatcher.addProofCommandResponseListener(onProofCommandResponse);
+            } else {
+                this.client.onRequest(serverEvent.proveFormulaResponse, onProveFormulaResponse);
+                this.client.onRequest(serverEvent.proofCommandResponse, onProofCommandResponse);
+            }
         });
         return success;
     }
@@ -435,8 +455,8 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             let xtermMsg: string = "";
             // PVS returns QED twice, one time just the QED string, another time an object with the sequent and a more detailed commentary, we want to show QED only once with the detailed commentary
             if (typeof data.res === "object" && isQEDProofState(data.res)) {
-                xtermMsg = fsUtils.formatSequent(data.res, { 
-                    colorTheme: this.colorTheme, 
+                xtermMsg = fsUtils.formatSequent(data.res, {
+                    colorTheme: this.colorTheme,
                     colorizeParens: this.colorizeParens,
                     useColors: true
                 });
@@ -463,21 +483,21 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                 const pp: string = this.prettyPrinter?.file; //vscodeUtils.getPrettyPrinter();
                 // console.log(`[${fsUtils.generateTimestamp()}] `+{ pp }); // debug #TODO remove
                 // format sequent
-                const sequent: string = fsUtils.formatSequent(data?.res, { 
-                    colorTheme: this.colorTheme, 
+                const sequent: string = fsUtils.formatSequent(data?.res, {
+                    colorTheme: this.colorTheme,
                     colorizeParens: this.colorizeParens,
                     useColors: true,
                     prettyPrinter: pp?.endsWith(".jar") ? { cmd: "java", options: [ "-jar", pp ] } : null, // only prettyprinters written in java are supported for now
-                    ...opt 
+                    ...opt
                 });
                 const lastState: string = fsUtils.sformulas2string(data.res);
                 const theoryContent: string = this.target?.fileContent;
                 const hints: HintsObject = getHints(this.sessionType, {
-                    lastState, 
+                    lastState,
                     theoryContent
                 });
                 this.log(sequent, { hints, mathObjects: this.mathObjects });
-                // show prompt unless QED 
+                // show prompt unless QED
                 if(!isQEDProofState(data.res)) { this.showPrompt(); }
                 commands.executeCommand("xterm.did-execute-command");
             }
@@ -566,7 +586,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                     const banner: string = colorUtils.colorText(
                         (data.response.result?.version?
                             utils.pvsioBannerAlt.replace("PVSio Evaluator",`PVSio Evaluator ${data.response.result?.version}`) :
-                            utils.pvsioBannerAlt), 
+                            utils.pvsioBannerAlt),
                         colorUtils.getColor(colorUtils.PvsColor.green, this.colorTheme));
                     const hints: HintsObject = getHints(this.sessionType, {
                         theoryContent: this.target?.fileContent
@@ -608,7 +628,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             } else if(data.res) {
                 if (typeof data.res === "string") {
                     const hints: HintsObject = getHints(this.sessionType, {
-                        lastState: data.res, 
+                        lastState: data.res,
                         theoryContent: this.target?.fileContent
                     });
                     this.log(data.res, { hints });
@@ -632,7 +652,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                         const pvsResult: string = data.res.pvsResult.trim();
                         if (pvsResult.length) {
                             const hints: HintsObject = getHints(this.sessionType, {
-                                lastState: pvsResult, 
+                                lastState: pvsResult,
                                 theoryContent: this.target?.fileContent
                             });
                             this.log(colorUtils.colorText(butFirstBL+data.res.promptOut, colorUtils.getColor(colorUtils.PvsColor.gold, this.colorTheme))
@@ -643,7 +663,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                         const lispResult: string = data.res.lispResult.trim();
                         if (lispResult.length){
                             const hints: HintsObject = getHints(this.sessionType, {
-                                lastState: lispResult, 
+                                lastState: lispResult,
                                 theoryContent: this.target?.fileContent
                             });
                             this.log(colorUtils.colorText(butFirstBL+lispResult, colorUtils.getColor(colorUtils.PvsColor.white, this.colorTheme)), {hints});
@@ -664,7 +684,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             }
         }
     }
-    
+
     /**
      * Reboot evaluator session programmatically
      */
@@ -688,7 +708,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
         }
         return false;
     }
-    
+
     /**
      * Disables a terminal session
      */
@@ -707,7 +727,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
     sendText (text: string, addNewLine?: boolean): void {
         this.write(text);
     }
-    
+
     /**
      * Sends a command to pvs-server
      */
@@ -726,7 +746,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                 //     this.onEvaluatorResponse(data);
                 //     resolve(data)
                 // });
-            } 
+            }
             if (this.sessionType === "prover") {
                 const command: PvsProofCommand = {
                     cmd: balancePar(text.trim()),
@@ -772,17 +792,26 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                 const parens: CheckParResult = checkPar(req?.cmd, { includeStringContent: true });
 				if (parens?.success) {
                     this.client.sendRequest(serverRequest.proofCommand, req);
-                    this.client.onRequest(serverEvent.proofCommandResponse, (data: ProofCommandResponse) => {
-                      console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+                    const onProofCommandResponse = (data: ProofCommandResponse) => {
+                        console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
                         data.req = req; // copy request to make sure meta fields are preserved, e.g., 'origin', as this is needed by the prover console to show correct feedback
                         this.onProverResponse(data);
-                        const success: boolean = data ? 
+                        const success: boolean = data ?
                             typeof data.res === "string" ? isQEDCommand(data.res)
                                 : !isInvalidCommand(data.res) && !noChange(data.res)
                                     : false;
+                        
+                        if (this.eventsDispatcher) {
+                            this.eventsDispatcher.removeProofCommandResponseListener(onProofCommandResponse);
+                        }
                         resolve(success);
-                        // resolve(data);
-                    });
+                    };
+
+                    if (this.eventsDispatcher) {
+                        this.eventsDispatcher.addProofCommandResponseListener(onProofCommandResponse);
+                    } else {
+                        this.client.onRequest(serverEvent.proofCommandResponse, onProofCommandResponse);
+                    }
                 } else {
                     // report unbalanced parens to the user
                     const err: PvsProofState = {
@@ -911,9 +940,9 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
     /**
      * Logs data in the terminal
      */
-    log (data: string, opt?: { 
-        sessionEnd?: boolean, 
-        hints?: HintsObject, 
+    log (data: string, opt?: {
+        sessionEnd?: boolean,
+        hints?: HintsObject,
         mathObjects?: MathObjects
     }): void {
         // console.log(`[${fsUtils.generateTimestamp()}] `+"[vscode-pvs-xterm] log", data);
@@ -1041,7 +1070,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             command: XTermCommands.showHelpMessage,
             data: msg
         };
-        this.panel?.webview?.postMessage(message);    
+        this.panel?.webview?.postMessage(message);
     }
     /**
      * Clears the command line in the terminal
@@ -1096,10 +1125,10 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
     protected terminateSession (): void {
         // disable handlers
         this.client.onRequest(serverEvent.proofCommandResponse,() => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse}`); // #DEBUG        
+            console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse}`); // #DEBUG
         });
         this.client.onRequest(serverEvent.evaluatorCommandResponse, () => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.evaluatorCommandResponse}`); // #DEBUG        
+            console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.evaluatorCommandResponse}`); // #DEBUG
         });
         // clear session type -- this is equivalent to marking the session as terminated
         this.sessionType = null;
@@ -1175,7 +1204,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                                             if (message?.data) {
                                                 // check if this is a meta command
                                                 if (message.data === interruptCommand) {
-                                                    this.sessionType === "prover" ? 
+                                                    this.sessionType === "prover" ?
                                                         commands.executeCommand("vscode-pvs.interrupt-prover")
                                                             : commands.executeCommand("vscode-pvs.interrupt-pvs");
                                                 } else if (utils.isQuitCommand(message.data) && this.sessionType === "prover") {
@@ -1208,7 +1237,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                                                     if (!utils.isQuitCommand(message.data)) {
                                                         this.running(false);
                                                         this.showWelcomeMessage();
-                                                    }    
+                                                    }
                                                 }
                                             }
                                             break;
@@ -1257,7 +1286,7 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                                         }
                                         case XTermEvent.proofExplorerBack:
                                         case XTermEvent.proofExplorerForward:
-                                        case XTermEvent.proofExplorerRun: 
+                                        case XTermEvent.proofExplorerRun:
                                         case XTermEvent.proofExplorerEdit: {
                                             commands.executeCommand(message.command);
                                             break;
@@ -1277,9 +1306,9 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
                         );
                         // Create webview content
                         this.createContent();
-                        // reveal the panel 
+                        // reveal the panel
                         this.panel.reveal(ViewColumn.Active, false); // false allows the webview to steal the focus
-                        
+
                         // commands.executeCommand("workbench.action.positionPanelBottom");
 
                         // set language to pvs
@@ -1303,11 +1332,11 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
 
             const bootstrapJsOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/bootstrap/dist/js/bootstrap.bundle.min.js'));
             const bootstrapCssOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/bootstrap/dist/css/bootstrap.min.css'));
-            
+
             const backboneOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/backbone/backbone-min.js'));
             const underscoreOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/underscore/underscore-min.js'));
             const handlebarsOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/handlebars/dist/handlebars.min.js'));
-    
+
             const jqueryOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/jquery/dist/jquery.min.js'));
             const fontawesomeCssOnDisk: Uri = Uri.file(path.join(this.context.extensionPath, 'client/node_modules/font-awesome/css/font-awesome.min.css'));
 
