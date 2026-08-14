@@ -503,6 +503,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 				pathEvaluator: this.pathEvaluator
 			});
 			this.eventsDispatcher.activate(context);
+			(this.xterm as any).setEventsDispatcher(this.eventsDispatcher);
 
 			this.mcpHttpServer = new McpHttpServer(this.eventsDispatcher);
 			this.mcpHttpServer.start();

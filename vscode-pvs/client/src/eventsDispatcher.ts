@@ -2,8 +2,8 @@
  * @module VSCodeEventsDispatcher
  * @author Paolo Masci
  * @date 2019.10.12
- * @copyright 
- * Copyright 2019 United States Government as represented by the Administrator 
+ * @copyright
+ * Copyright 2019 United States Government as represented by the Administrator
  * of the National Aeronautics and Space Administration. All Rights Reserved.
  *
  * Disclaimers
@@ -42,16 +42,16 @@ import { VSCodePvsEmacsBindingsProvider } from "./providers/vscodePvsEmacsBindin
 import { VSCodePvsWorkspaceExplorer, TheoryItem, TccsOverviewItem, WorkspaceOverviewItem, FormulaItem } from "./views/vscodePvsWorkspaceExplorer";
 import { VSCodePvsProofExplorer, ProofItem, ProofExplorerEvent } from "./views/vscodePvsProofExplorer";
 // import { TerminalSession, VSCodePvsTerminal } from "./views/vscodePvsTerminal";
-import { 
-    PvsContextDescriptor, serverEvent, serverRequest, PvsVersionDescriptor, 
-    ProofDescriptor, ServerMode, PvsFormula, ProofEditEvent, PvsProofCommand, 
-    ProofExecEvent, PvsTheory, ProofExecInterruptProver, WorkspaceEvent, 
-    ProofExecInterruptAndQuitProver, FileDescriptor, ContextFolder, 
-    PvsioEvaluatorCommand, EvalExpressionRequest, ProveFormulaResponse, 
-    ProofCommandResponse, ProofMateProfile, ProveFormulaRequest, PvsFile, 
-    CopyProofliteRequest, SaveProofResponse, GotoFileDescriptor, 
-    FormulaDescriptor, quickFixReplaceCommand, QuickFixReplace, QuickFixAddImporting, 
-    quickFixAddImportingCommand, VSCodePvsVersionDescriptor, DumpPvsFilesRequest, 
+import {
+    PvsContextDescriptor, serverEvent, serverRequest, PvsVersionDescriptor,
+    ProofDescriptor, ServerMode, PvsFormula, ProofEditEvent, PvsProofCommand,
+    ProofExecEvent, PvsTheory, ProofExecInterruptProver, WorkspaceEvent,
+    ProofExecInterruptAndQuitProver, FileDescriptor, ContextFolder,
+    PvsioEvaluatorCommand, EvalExpressionRequest, ProveFormulaResponse,
+    ProofCommandResponse, ProofMateProfile, ProveFormulaRequest, PvsFile,
+    CopyProofliteRequest, SaveProofResponse, GotoFileDescriptor,
+    FormulaDescriptor, quickFixReplaceCommand, QuickFixReplace, QuickFixAddImporting,
+    quickFixAddImportingCommand, VSCodePvsVersionDescriptor, DumpPvsFilesRequest,
     DumpPvsFilesResponse, UndumpPvsFilesRequest, UndumpPvsFilesResponse, FollowLink,
     TypeCheckFileRequest,
     PrettyPrintExpandedResponse
@@ -81,14 +81,14 @@ import { VSCodePvsPathEvaluator } from "./views/vscodePvsPathEvaluator";
 
 // FIXME: use Backbone.Model
 export class EventsDispatcher {
-    protected client: LanguageClient;
+    public client: LanguageClient;
     protected statusBar: VSCodePvsStatusBar;
     protected emacsBindings: VSCodePvsEmacsBindingsProvider;
     protected workspaceExplorer: VSCodePvsWorkspaceExplorer;
     protected proofExplorer: VSCodePvsProofExplorer;
 
     // protected vscodePvsTerminal: VSCodePvsTerminal;
-    protected xterm: VSCodePvsXTerm;
+    public xterm: VSCodePvsXTerm;
 
     // debounce timer
     protected uiDebouncer: NodeJS.Timeout = null;
@@ -129,6 +129,16 @@ export class EventsDispatcher {
 
     public removeProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void) {
         this.proveFormulaResponseListeners = this.proveFormulaResponseListeners.filter(l => l !== cb);
+    }
+
+    protected typecheckFileResponseListeners: Array<(desc: any) => void> = [];
+
+    public addTypecheckFileResponseListener(cb: (desc: any) => void) {
+        this.typecheckFileResponseListeners.push(cb);
+    }
+
+    public removeTypecheckFileResponseListener(cb: (desc: any) => void) {
+        this.typecheckFileResponseListeners = this.typecheckFileResponseListeners.filter(l => l !== cb);
     }
 
     constructor (client: LanguageClient, handlers: {
@@ -247,15 +257,15 @@ export class EventsDispatcher {
 				this.workspaceExplorer.updateContextFolder(desc, { theoriesFromActiveFile: this.showTheoriesFromActiveFile });
 			}
 		});
-		this.client.onRequest(serverEvent.latexTheoriesResponse, (desc: { 
-            response: PvsResponse, 
-            args: { 
-                fileName: string, 
-                fileExtension: string, 
-                contextFolder: string 
+		this.client.onRequest(serverEvent.latexTheoriesResponse, (desc: {
+            response: PvsResponse,
+            args: {
+                fileName: string,
+                fileExtension: string,
+                contextFolder: string
             }
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.latexTheoriesResponse} - param: ${desc} `); // #DEBUG            
+            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.latexTheoriesResponse} - param: ${desc} `); // #DEBUG
             if(desc.response?.result && desc.response.result["main-file"] ){
                 const mainFile: string = desc.response.result["main-file"];
                 const mainFileFolder: string = path.dirname(mainFile);
@@ -267,15 +277,15 @@ export class EventsDispatcher {
                 vscode.window.showTextDocument(uri, { preserveFocus: true, preview: true, viewColumn });
             }
         });
-		this.client.onRequest(serverEvent.typecheckFileResponse, (desc: { 
-            response: PvsResponse, 
-            args: { 
-                fileName: string, 
-                fileExtension: string, 
-                contextFolder: string 
+		this.client.onRequest(serverEvent.typecheckFileResponse, (desc: {
+            response: PvsResponse,
+            args: {
+                fileName: string,
+                fileExtension: string,
+                contextFolder: string
             }
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.typecheckFileResponse} - param: ${desc} `); // #DEBUG            
+            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.typecheckFileResponse} - param: ${desc} `); // #DEBUG
             // request tccs for the files that typecheck correctly
             if (desc && desc.response && desc.response.result && desc.args) {
                 this.client.sendRequest(serverRequest.generateTccs, {
@@ -285,24 +295,31 @@ export class EventsDispatcher {
                     quiet: true
                 });
             }
+            this.typecheckFileResponseListeners.forEach(listener => {
+                try {
+                    listener(desc);
+                } catch (e) {
+                    console.error("Error in typecheck", e);
+                }
+            });
         });
         this.client.onNotification(serverRequest.generateTccs, (desc: {
-            response: PvsContextDescriptor, 
-            args: { 
-                fileName: string, 
-                fileExtension: string, 
-                contextFolder: string 
+            response: PvsContextDescriptor,
+            args: {
+                fileName: string,
+                fileExtension: string,
+                contextFolder: string
             }
         }) => {
             if (this.workspaceExplorer && desc?.response) {
                 this.workspaceExplorer.updateContextFolder(desc.response, { tccDescriptor: true, theoriesFromActiveFile: this.showTheoriesFromActiveFile });
             }
         });
-        this.client.onRequest(serverRequest.showTccs, (desc: { 
-            response: PvsContextDescriptor, 
+        this.client.onRequest(serverRequest.showTccs, (desc: {
+            response: PvsContextDescriptor,
             args: FileDescriptor
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverRequest.showTccs} - param: ${desc} `); // #DEBUG            
+            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverRequest.showTccs} - param: ${desc} `); // #DEBUG
             if (this.workspaceExplorer && desc?.response) {
                 this.workspaceExplorer.updateContextFolder(desc.response, { tccDescriptor: true, theoriesFromActiveFile: this.showTheoriesFromActiveFile });
             }
@@ -380,15 +397,15 @@ export class EventsDispatcher {
 			switch (desc.action) {
 				case "did-append-node": {
                     this.proofExplorer.didAppendNode(desc);
-                    break; 
+                    break;
                 }
 				case "did-copy-node": {
-                    this.proofExplorer.didCopyNode(desc); 
-                    break; 
+                    this.proofExplorer.didCopyNode(desc);
+                    break;
                 }
 				case "did-copy-tree": {
-                    this.proofExplorer.didCopyTree(desc); 
-                    break; 
+                    this.proofExplorer.didCopyTree(desc);
+                    break;
                 }
                 case "did-delete-node": {
                     this.proofExplorer.didDeleteNode(desc);
@@ -407,20 +424,20 @@ export class EventsDispatcher {
                     break;
                 }
 				case "did-trim-node": {
-                    this.proofExplorer.didTrimNode(desc); 
-                    break; 
+                    this.proofExplorer.didTrimNode(desc);
+                    break;
                 }
 				case "did-rename-node": {
-                    this.proofExplorer.didRenameNode(desc); 
-                    break; 
+                    this.proofExplorer.didRenameNode(desc);
+                    break;
 				}
 				case "did-activate-cursor": {
-                    this.proofExplorer.didActivateCursor(desc); 
-                    break; 
+                    this.proofExplorer.didActivateCursor(desc);
+                    break;
 				}
 				case "did-deactivate-cursor": {
-                    this.proofExplorer.didDeactivateCursor(desc); 
-                    break; 
+                    this.proofExplorer.didDeactivateCursor(desc);
+                    break;
 				}
 				case "did-update-proof-status": {
                     this.proofExplorer.didUpdateProofStatus(desc);
@@ -483,7 +500,7 @@ export class EventsDispatcher {
                     } else {
                         window.showWarningMessage(`Failed to load proof (null descriptor)`);
                     }
-                    break;    
+                    break;
                 }
                 case "did-stop-running": {
                     this.proofExplorer?.didStopRunning();
@@ -532,13 +549,13 @@ export class EventsDispatcher {
 
         // register handler that will resolve the promise when the proof needs to be saved
         this.client.onNotification(serverRequest.saveProof, async (desc: {
-            response: SaveProofResponse, 
-            args: { 
-                fileName: string, 
-                fileExtension: string, 
-                theoryName: string, 
-                formulaName: string, 
-                contextFolder: string, 
+            response: SaveProofResponse,
+            args: {
+                fileName: string,
+                fileExtension: string,
+                theoryName: string,
+                formulaName: string,
+                contextFolder: string,
                 proofDescriptor: ProofDescriptor
             }
         }) => {
@@ -601,7 +618,7 @@ export class EventsDispatcher {
             //     }
             //     // start proof
             //     // this.proofExplorer.startProof();
-            //     this.proofMate.startProof();                
+            //     this.proofMate.startProof();
             // }
             this.proveFormulaResponseListeners.forEach(listener => {
                 try {
@@ -682,7 +699,7 @@ export class EventsDispatcher {
             const flag: boolean = vscodeUtils.getConfigurationFlag("pvs.settings.prover.@QED");
             if (flag) {
                 const formula: PvsFormula = desc?.request;
-                if (formula && formula.line && formula.fileName && formula.fileExtension 
+                if (formula && formula.line && formula.fileName && formula.fileExtension
                         && formula.contextFolder && formula.formulaName) {
                     await vscodeUtils.annotateFormula(formula, "@QED");
                 }
@@ -692,7 +709,7 @@ export class EventsDispatcher {
             // this.proofMate.saveSketchpadClips();
         });
 
-        this.client.onRequest(serverEvent.showTheorySummaryResponse, (desc: { 
+        this.client.onRequest(serverEvent.showTheorySummaryResponse, (desc: {
             response: FileDescriptor,
             args: PvsTheory
         }) => {
@@ -701,11 +718,11 @@ export class EventsDispatcher {
                 vscodeUtils.showTextDocument(desc.response);
             }
         });
-        
+
         this.client.onNotification(serverEvent.profilerData, (data: string) => {
             this.logger.profilerData(data);
         });
-        
+
         this.client.onNotification("pvs.progress-info", (msg: string) => {
             this.statusBar.showProgress(msg);
         });
@@ -732,7 +749,7 @@ export class EventsDispatcher {
                 const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
                 const document: vscode.TextDocument = activeEditor?.document;
                 const line: number = window?.activeTextEditor?.selection?.active ? activeEditor?.selection?.active?.line : 0;
-                desc = document ? { 
+                desc = document ? {
                     fileName: fsUtils.getFileName(document.fileName),
                     fileExtension: fsUtils.getFileExtension(document.fileName),
                     contextFolder: fsUtils.getContextFolder(document.fileName),
@@ -778,8 +795,8 @@ export class EventsDispatcher {
         }));
         context.subscriptions.push(commands.registerCommand("vscode-pvs.select-pvs-path", async () => {
             await this.packageManager.pvsInstallationWizard({
-				msg: `Please choose one of the following actions.\n`, 
-				update: true, 
+				msg: `Please choose one of the following actions.\n`,
+				update: true,
 				preferDefaultFolder: true
 			});
         }));
@@ -866,8 +883,8 @@ export class EventsDispatcher {
 			const ans: string | undefined = await vscode.window.showInformationMessage(msg, { modal: true }, yesNo[0])
 			if (ans === yesNo[0]) {
                 const currentContext: string = vscodeUtils.getRootPath();
-                const req = { 
-                    cleanFolder: currentContext, 
+                const req = {
+                    cleanFolder: currentContext,
                     externalServer: vscodeUtils.getConfigurationFlag("pvs.externalServer"),
                     webSocketPort: vscodeUtils.getConfigurationValue("pvs.initialPortNumber") };
                 this.client.sendRequest(serverRequest.rebootPvsServer, req);
@@ -942,8 +959,8 @@ export class EventsDispatcher {
             await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
             await vscode.commands.executeCommand("workbench.action.closePanel");
             this.client.outputChannel.show(false);
-            
-            // @M3 Since version 8.0, PVS stores log information in the 
+
+            // @M3 Since version 8.0, PVS stores log information in the
             //     folder ~/.pvslog, let's use the same folder to store
             //     our log file.
             const logFolder: string = path.join(fsUtils.HOME_DIR, ".pvslog");
@@ -966,7 +983,7 @@ export class EventsDispatcher {
             const ok: string = "Ok";
             const item = await window.showInformationMessage(`Report Issue                                                              `, {
                 modal: true,
-                detail: 
+                detail:
 `Please send a brief description of the issue, along with the following log ${pvsLogFile ? "files": "file"} (which will now be opened in the editor):
 
 • ${vscodePvsLogFile}
@@ -1063,7 +1080,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         //         // if the file is currently open in the editor, save file first
         //         await vscode.window.activeTextEditor.document.save();
         //         let formula: PvsFormula = resource2desc(vscode.window.activeTextEditor.document.fileName);
-        
+
         // // const document: vscode.TextDocument = window.activeTextEditor.document;
         // const info: { content: string, line: number } = {
         //     content: vscode.window.activeTextEditor.document.getText(),
@@ -1071,7 +1088,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         // };
         // desc.theoryName = info.content ? fsUtils.findTheoryName(info.content, info.line) : null;
         // desc.formulaName = desc.theoryName ? fsUtils.findFormulaName(info.content, info.line) : null;
-        
+
         // vscode-pvs.show-prooflite
         context.subscriptions.push(commands.registerCommand("vscode-pvs.show-prooflite", async (resource: string | { path: string } | { contextValue: string }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1121,8 +1138,8 @@ Disclaimer: the logs could contain information about the system, such as name of
 
                 //             return new Promise<void>((resolve, reject) => {
                 //                 this.client.sendRequest(serverRequest.showProofLite, desc);
-                //                 this.client.onRequest(serverEvent.showProofLiteResponse, async (desc: { 
-                //                     response: { proofFile: FileDescriptor }, 
+                //                 this.client.onRequest(serverEvent.showProofLiteResponse, async (desc: {
+                //                     response: { proofFile: FileDescriptor },
                 //                     args: PvsFormula
                 //                 }) => {
                 //                     if (desc && desc.args && desc.response && desc.response.proofFile) {
@@ -1137,8 +1154,8 @@ Disclaimer: the logs could contain information about the system, such as name of
                 //                         this.statusBar.ready();
                 //                         progress.report({ message: `Done!`, increment: 100 });
                 //                         resolve();
-                //                         // vscodeUtils.previewTextDocument(`${desc.args.theoryName}.prlite`, desc.response, { 
-                //                         //     contextFolder: path.join(desc.args.contextFolder, "pvsbin"), 
+                //                         // vscodeUtils.previewTextDocument(`${desc.args.theoryName}.prlite`, desc.response, {
+                //                         //     contextFolder: path.join(desc.args.contextFolder, "pvsbin"),
                 //                         //     viewColumn: vscode.ViewColumn.Beside
                 //                         // });
                 //                     } else {
@@ -1260,8 +1277,8 @@ Disclaimer: the logs could contain information about the system, such as name of
             if (desc?.fileName) {
                 this.client.sendRequest(serverRequest.prettyprintExpanded, { file: desc }); // async call
                 this.client.onNotification(serverRequest.prettyprintExpanded, (res: PrettyPrintExpandedResponse) => {
-                    vscodeUtils.previewTextDocument(res.ans.fileName + res.ans.fileExtension, res.ans.fileContent, { 
-                        contextFolder: res.ans.contextFolder, 
+                    vscodeUtils.previewTextDocument(res.ans.fileName + res.ans.fileExtension, res.ans.fileContent, {
+                        contextFolder: res.ans.contextFolder,
                         viewColumn: vscode.ViewColumn.Beside
                     });
                 });
@@ -1287,7 +1304,7 @@ Disclaimer: the logs could contain information about the system, such as name of
 
         // evaluate expression and open
         context.subscriptions.push(commands.registerCommand("vscode-pvs.open-path-expression", async (resource: {
-            path: string, expr: string 
+            path: string, expr: string
         }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
             if (resource) {
@@ -1326,14 +1343,14 @@ Disclaimer: the logs could contain information about the system, such as name of
 
         // pvsio-plot
         context.subscriptions.push(commands.registerCommand("vscode-pvs.plot-expression", async (resource: string | {
-            path: string, expr?: string 
-        } | { 
-            contextValue: string 
-        } | { 
-            fileName?: string, 
-            fileExtension?: string, 
-            contextFolder?: string, 
-            theoryName?: string, 
+            path: string, expr?: string
+        } | {
+            contextValue: string
+        } | {
+            fileName?: string,
+            fileExtension?: string,
+            contextFolder?: string,
+            theoryName?: string,
             expr?: string
         }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1349,7 +1366,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 if (desc) {
                     if (!desc.theoryName) {
                         const possibleContent = activeEditor?.document?.getText();
-                        const info: { content: string, line: number } = // (resource["path"]) 
+                        const info: { content: string, line: number } = // (resource["path"])
                         !possibleContent
                         ? { content: fsUtils.readFile((<{ path: string }>resource)["path"]), line: 0 }
                             : { content: activeEditor?.document?.getText(), line: activeEditor?.selection?.active?.line };
@@ -1444,7 +1461,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         }));
         // vscode-pvs.prove-theory
         // the sequence of events triggered by this command is:
-        // 1. vscodePvsTerminal.startProverSession(desc) 
+        // 1. vscodePvsTerminal.startProverSession(desc)
         // 2. vscodePvsTerminal.sendRequest(serverCommand.proveFormula, desc)
         // 3. pvsLanguageServer.proveFormulaRequest(desc)
         //      3.1 typecheck
@@ -1471,7 +1488,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.proofExplorer.disableView();
                     this.xterm.bye();
 
-                    const msg: string = (opt.unprovedOnly) ? 
+                    const msg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved J-PRF proofs (theory ${desc.theoryName})` : `Running unproved proofs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running J-PRF proofs (theory ${desc.theoryName})` : `Re-running proofs in theory ${desc.theoryName}`;
                     this.statusBar.showProgress(msg);
@@ -1547,14 +1564,14 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.proofExplorer.disableView();
                     this.xterm.bye();
                     // compose feedback message
-                    const msg: string = (opt.unprovedOnly) ? 
+                    const msg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved J-PRF TCCs (theory ${desc.theoryName})` : `Running unproved TCCs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running J-PRF TCCs (theory ${desc.theoryName})` : `Re-running TCCs in theory ${desc.theoryName}`;
                     this.statusBar.showProgress(msg);
                     // prove with progress
                     await this.workspaceExplorer.proveTheoryWithProgress(desc, {
-                        tccsOnly: true, 
-                        useJprf: opt.useJprf, 
+                        tccsOnly: true,
+                        useJprf: opt.useJprf,
                         unprovedOnly: opt.unprovedOnly
                     });
                     // clear status bar
@@ -1594,14 +1611,14 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.proofExplorer.disableView();
                     this.xterm.bye();
                     // compose feedback message
-                    const msg: string = (opt.unprovedOnly) ? 
+                    const msg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved ${allTccs ? "" : formulaName + " "}J-PRF TCCs (theory ${desc.theoryName})` : `Running unproved ${allTccs ? "" : formulaName + " "} TCCs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running ${allTccs ? "" : formulaName + " "}J-PRF TCCs (theory ${desc.theoryName})` : `Re-running ${allTccs ? "" : formulaName + " "}TCCs in theory ${desc.theoryName}`;
                     this.statusBar.showProgress(msg);
                     // prove with progress
                     await this.workspaceExplorer.proveTheoryWithProgress(desc, {
-                        tccsOnly: true, 
-                        useJprf: opt.useJprf, 
+                        tccsOnly: true,
+                        useJprf: opt.useJprf,
                         unprovedOnly: opt.unprovedOnly,
                         match: formulaName && !allTccs ? new RegExp(`${formulaName}_TCC`, "g") : null
                     });
@@ -1665,7 +1682,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 console.error("[vscode-events-dispatcher] Error: vscode-pvs.discharge-tccs invoked with null resource", resource);
             }
         }));
-        
+
         context.subscriptions.push(commands.registerCommand("vscode-pvs.clean-bin", async () => {
             // ask the user confirmation before deleting bin files
 			const yesno: string[] = [ "Yes", "No" ];
@@ -1738,7 +1755,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 ((typeof resource === 'string'? (<string>resource) : 'file' in resource ?(<TypeCheckFileRequest>resource).file : resource)),
                     force: ((typeof resource !== 'string' && 'force' in resource ?(<TypeCheckFileRequest>resource).force : false))
                 }
-                
+
                 if (isPvsFile(requestParam.file)) {
                     // show output panel for feedback
                     // commands.executeCommand("workbench.action.output.toggleOutput", true);
@@ -1755,7 +1772,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         context.subscriptions.push(commands.registerCommand("vscode-pvs.typecheck-file-inline", async (resource: string | { path: string } | { contextValue: string }) => {
             commands.executeCommand("vscode-pvs.typecheck-file", resource);
         }));
-        
+
         // vscode-pvs.dump-pvs-files
 		context.subscriptions.push(commands.registerCommand("vscode-pvs.dump-pvs-files", async (resource: string | { path: string } | { contextValue: string }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1781,7 +1798,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                         } else {
                             vscodeUtils.showWarningMessage(`Unable to dump file (${ans?.error})`);
                         }
-                    });    
+                    });
                 }
             } else {
                 console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
@@ -1860,17 +1877,17 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.generateTccs, desc);
                     // register handler for response
                     this.client.onNotification(serverRequest.generateTccs, (desc: {
-                        response: PvsContextDescriptor, 
-                        args: { 
-                            fileName: string, 
-                            fileExtension: string, 
-                            contextFolder: string 
+                        response: PvsContextDescriptor,
+                        args: {
+                            fileName: string,
+                            fileExtension: string,
+                            contextFolder: string
                         }
                     }) => {
                         if (this.workspaceExplorer && desc?.response) {
                             this.workspaceExplorer.updateContextFolder(desc.response, { tccDescriptor: true, theoriesFromActiveFile: this.showTheoriesFromActiveFile });
                         }
-                    });            
+                    });
                 }
             } else {
                 console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
@@ -1893,7 +1910,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
-        
+
         // vscode-pvs.parse-workspace
 		context.subscriptions.push(commands.registerCommand("vscode-pvs.parse-workspace", async (resource: string | { path: string } | { contextValue: string }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1930,7 +1947,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
-        
+
         // vscode-pvs.hp2pvs
 		context.subscriptions.push(commands.registerCommand("vscode-pvs.hp2pvs", async (resource: string | { path: string } | { contextValue: string }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -2054,7 +2071,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 vscodeUtils.showInformationMessage(desc.msg);
             }
         });
-        this.client.onNotification("server.status.start-important-task", 
+        this.client.onNotification("server.status.start-important-task",
             (desc: { id: string, msg: string, increment?: number
                      taskName?: string, affectedObject?: string }) => {
             if (desc && desc.msg) {
@@ -2069,12 +2086,12 @@ Disclaimer: the logs could contain information about the system, such as name of
                     });
                     return;
                 }
-                
+
                 // show dialog with progress
                 window.withProgress({
                     location: ProgressLocation.Notification,
-                    cancellable: false // @M3 #TODO disabled cancellable until a way to cancel operations via web-socket communication is established 
-                }, (progress, token) => { 
+                    cancellable: false // @M3 #TODO disabled cancellable until a way to cancel operations via web-socket communication is established
+                }, (progress, token) => {
                     let complete: boolean = false;
                     // show initial dialog with spinning progress
                     progress.report({ increment: -1, message: desc.msg });
@@ -2104,7 +2121,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                             let msg: string = desc.msg;
                             if (desc) {
                                 // shorten message
-                                msg = msg.replace(/ in [\d\.]+ ?s.*$/, ""); 
+                                msg = msg.replace(/ in [\d\.]+ ?s.*$/, "");
                                 this.statusBar.showProgress(msg.replace(vscodeUtils.getRootPath(), "\$(workspace-trusted)"), desc.msg);
                                 progress.report({
                                     increment: isNaN(desc.increment) ? -1 : desc.increment,
@@ -2139,7 +2156,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                             if (desc && desc.msg) {
                                 this.statusBar.showError(desc.msg);
                                 // NOTE: we don't have APIs to close old error dialogs that contain stale information.
-                                // The user will need to close the error dialog. 
+                                // The user will need to close the error dialog.
                                 // If the user doesn't close the dialog, the message may show up later, and bring confusion.
                                 // vscodeUtils.showErrorMessage(desc.msg);
                                 vscodeUtils.showErrorMessage("Error: " + desc.msg);

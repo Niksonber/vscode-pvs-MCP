@@ -14,7 +14,7 @@ export class McpHttpServer {
     private server: any = null;
     private activeFormula: any = null;
 
-    constructor(private eventsDispatcher: EventsDispatcher) {}
+    constructor(private eventsDispatcher: EventsDispatcher, ) {}
 
     public start(port = 23457): void {
         const app = express();
@@ -27,27 +27,12 @@ export class McpHttpServer {
         });
 
         mcpServer.registerTool(
-            "notify user",
-            {
-                description: "start a user notification on pvs",
-                inputSchema: {
-                    messages: z.string().describe("message to show to user on pvs interface")
-                }
-            },
-            async ({ messages }) => {
-                vscode.window.showInformationMessage(`[MCP] Show message ${messages}`);
-                return;
-            }
-        );
-
-
-        mcpServer.registerTool(
             "start_proof",
             {
                 description: "Start proof session",
-                inputSchema: {
+                inputSchema:  z.object({
                     formula_path: z.string().describe("The formula path, in the format 'filepath#formula_name'")
-                }
+                })
             },
             async ({ formula_path }) => {
                 if (!formula_path) {
@@ -94,7 +79,7 @@ export class McpHttpServer {
                 // Set up a promise to wait for the proveFormulaResponse
                 const waitForResponse = new Promise<ProveFormulaResponse>((resolve) => {
                     const listener = (desc: ProveFormulaResponse) => {
-                        // this.eventsDispatcher.removeProveFormulaResponseListener(listener);
+                        this.eventsDispatcher.removeProveFormulaResponseListener(listener);
                         resolve(desc);
                     };
                     this.eventsDispatcher.addProveFormulaResponseListener(listener);
@@ -102,6 +87,7 @@ export class McpHttpServer {
 
                 // Trigger the VSCode prove command
                 await vscode.commands.executeCommand("vscode-pvs.prove-formula", this.activeFormula);
+
 
                 // Await response from PVS
                 const desc = await waitForResponse;
@@ -114,7 +100,7 @@ export class McpHttpServer {
                 this.activeFormula.id = proof_id;
 
                 // Formulate response compatible with raw PVS WS output
-                const responsePayload = [{
+                const responsePayload = {
                     id: desc?.req?.formulaName || formulaName,
                     result: [
                         {
@@ -124,7 +110,7 @@ export class McpHttpServer {
                                 : ["Proof started"]
                         }
                     ]
-                }];
+                };
 
                 return {
                     content: [{ type: "text", text: JSON.stringify(responsePayload) }]
@@ -137,9 +123,9 @@ export class McpHttpServer {
             "apply_proof_command",
             {
                 description: "Apply proof command",
-                inputSchema: {
+                inputSchema: z.object({
                     command: z.string().describe("The proof command to execute (e.g., '(grind)')")
-                }
+                })
             },
             async ({ command }) => {
                 if (!command) {
@@ -149,14 +135,8 @@ export class McpHttpServer {
                 vscode.window.showInformationMessage(`[MCP] Proof command: ${command}`);
 
                 if (!this.activeFormula) {
-                    throw new Error("No active formula. Please run prove_formula first.");
+                    throw new Error("No active formula. Please run start_proof first.");
                 }
-
-                const proofCommand = {
-                    ...this.activeFormula,
-                    cmd: command,
-                    origin: "mcp"
-                };
 
                 // Set up promise to wait for proofCommandResponse
                 const waitForResponse = new Promise<ProofCommandResponse>((resolve) => {
@@ -167,8 +147,8 @@ export class McpHttpServer {
                     this.eventsDispatcher.addProofCommandResponseListener(listener);
                 });
 
-                // Trigger the VSCode send proof command
-                await vscode.commands.executeCommand("vscode-pvs.send-proof-command", proofCommand);
+                // Trigger sending the text to the server via xterm so the terminal updates!
+                await this.eventsDispatcher.xterm.sendTextToServer(command);
 
                 // Await response from PVS
                 const desc = await waitForResponse;
@@ -191,7 +171,7 @@ export class McpHttpServer {
                 }
 
                 // Formulate response compatible with raw PVS WS output
-                const responsePayload = [{
+                const responsePayload = {
                     result: [
                         {
                             id: this.activeFormula.id,
@@ -200,7 +180,50 @@ export class McpHttpServer {
                             sequent: sequentObj
                         }
                     ]
-                }];
+                };
+
+                return {
+                    content: [{ type: "text", text: JSON.stringify(responsePayload) }]
+                };
+            }
+        );
+
+        // Register typecheck_file tool
+        mcpServer.registerTool(
+            "typecheck_file",
+            {
+                description: "Typecheck a PVS file",
+                inputSchema: z.object({
+                    file_path: z.string().describe("The absolute path of the PVS file to typecheck (e.g., '/path/to/theory.pvs')")
+                })
+            },
+            async ({ file_path }) => {
+                if (!file_path) {
+                    throw new Error("Missing file_path parameter");
+                }
+
+                vscode.window.showInformationMessage(`[MCP] Typechecking file: ${path.basename(file_path)}`);
+
+                // Set up a promise to wait for the typecheckFileResponse
+                const waitForResponse = new Promise<any>((resolve) => {
+                    const listener = (desc: any) => {
+                        this.eventsDispatcher.removeTypecheckFileResponseListener(listener);
+                        resolve(desc);
+                    };
+                    this.eventsDispatcher.addTypecheckFileResponseListener(listener);
+                });
+
+                // Trigger the VSCode typecheck file command
+                await vscode.commands.executeCommand("vscode-pvs.typecheck-file", file_path);
+
+                // Await response from PVS
+                const desc = await waitForResponse;
+
+                // Formulate response payload
+                const responsePayload = {
+                    file: file_path,
+                    result: desc?.response?.result || "Typechecking completed"
+                };
 
                 return {
                     content: [{ type: "text", text: JSON.stringify(responsePayload) }]
