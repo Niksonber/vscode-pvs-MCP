@@ -148,7 +148,7 @@ export class McpHttpServer {
                 });
 
                 // Trigger sending the text to the server via xterm so the terminal updates!
-                await this.eventsDispatcher.xterm.sendTextToServer(command);
+                await this.eventsDispatcher.xterm.sendTextToServer(command, false, "mcp-server");
 
                 // Await response from PVS
                 const desc = await waitForResponse;
