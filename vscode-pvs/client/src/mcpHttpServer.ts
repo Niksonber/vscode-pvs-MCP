@@ -6,7 +6,7 @@ import { ProofCommandResponse, ProveFormulaResponse } from './common/serverInter
 
 import express from 'express';
 import cors from 'cors';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
@@ -227,6 +227,97 @@ export class McpHttpServer {
 
                 return {
                     content: [{ type: "text", text: JSON.stringify(responsePayload) }]
+                };
+            }
+        );
+
+        mcpServer.registerResource(
+            "user-interface-docs",
+            "docs://user-interface",
+            {
+                title: "VSCode-PVS User Interface Documentation",
+                description: "Provides layout details, features, hotkeys, and tips for the VSCode-PVS user interface."
+            },
+            async (uri) => {
+                const extension = vscode.extensions.getExtension("paolomasci.vscode-pvs8");
+                let docPath = extension ? path.join(extension.extensionPath, "docs", "USER-INTERFACE.md") : "";
+                if (!docPath || !fs.existsSync(docPath)) {
+                    const workspaceFolders = vscode.workspace.workspaceFolders;
+                    const workspacePath = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : "";
+                    docPath = path.join(workspacePath, "docs", "USER-INTERFACE.md");
+                }
+                if (!fs.existsSync(docPath)) {
+                    docPath = path.join(__dirname, "..", "..", "docs", "USER-INTERFACE.md");
+                }
+
+                let content = "";
+                if (fs.existsSync(docPath)) {
+                    content = fs.readFileSync(docPath, 'utf8');
+                } else {
+                    content = "Error: USER-INTERFACE.md file not found.";
+                }
+
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: "text/markdown",
+                        text: content
+                    }]
+                };
+            }
+        );
+
+        mcpServer.registerResource(
+            "documentation",
+            new ResourceTemplate("docs://{topic}", { list: undefined }),
+            {
+                title: "VSCode-PVS Documentation",
+                description: "Access any of the documentation files (e.g., 'USER-INTERFACE', 'FAQ', 'TUTORIAL', 'WALKTHROUGH') to get layout, features, tutorials, hotkeys, or walkthrough info."
+            },
+            async (uri, { topic }) => {
+                if (!topic) {
+                    throw new Error("Missing topic parameter");
+                }
+
+                const topicStr = Array.isArray(topic) ? topic[0] : topic;
+                if (!topicStr) {
+                    throw new Error("Invalid topic parameter");
+                }
+
+                // Sanitize topic to avoid path traversal
+                const sanitizedTopic = path.basename(topicStr).toUpperCase();
+                const allowedTopics = ["USER-INTERFACE", "FAQ", "TUTORIAL", "WALKTHROUGH"];
+                
+                if (!allowedTopics.includes(sanitizedTopic)) {
+                    throw new Error(`Invalid topic. Allowed topics: ${allowedTopics.join(", ")}`);
+                }
+
+                const filename = `${sanitizedTopic}.md`;
+
+                const extension = vscode.extensions.getExtension("paolomasci.vscode-pvs8");
+                let docPath = extension ? path.join(extension.extensionPath, "docs", filename) : "";
+                if (!docPath || !fs.existsSync(docPath)) {
+                    const workspaceFolders = vscode.workspace.workspaceFolders;
+                    const workspacePath = workspaceFolders && workspaceFolders.length > 0 ? workspaceFolders[0].uri.fsPath : "";
+                    docPath = path.join(workspacePath, "docs", filename);
+                }
+                if (!fs.existsSync(docPath)) {
+                    docPath = path.join(__dirname, "..", "..", "docs", filename);
+                }
+
+                let content = "";
+                if (fs.existsSync(docPath)) {
+                    content = fs.readFileSync(docPath, 'utf8');
+                } else {
+                    content = `Error: ${filename} not found.`;
+                }
+
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: "text/markdown",
+                        text: content
+                    }]
                 };
             }
         );

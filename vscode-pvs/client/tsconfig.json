@@ -8,6 +8,7 @@
 		"sourceMap": true,
 		"types": [],
 		"strictNullChecks": false,
+		"skipLibCheck": true,
 		"esModuleInterop": true,
 		"allowSyntheticDefaultImports": true,
 		"typeRoots": [
