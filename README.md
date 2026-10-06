@@ -1,3 +1,29 @@
+
+## Installing VS Code-PVS MCP
+### 1. Install Visual Studio Code
+
+Download and install **Visual Studio Code**:
+
+* [Download VS Code](https://code.visualstudio.com/)
+
+### 2. Install the Extension (.vsix)
+
+The extension is provided as a compiled `.vsix` file located in the `releases` folder of this repository [.vsix](releases/vscode-pvs8-1.0.70-mcp2.vsix).
+
+1. Open Visual Studio Code.
+2. Go to the **Extensions** view by clicking the square icon on the left sidebar (or press `Ctrl+Shift+X`).
+3. Click the **three dots (...)** in the top-right corner of the Extensions pane.
+4. Select **Install from VSIX...**.
+5. Navigate to the `release` folder in the cloned repository and select the `.vsix` file.
+6. Restart VS Code if prompted.
+
+The **extension** will install **PVS** if it is not installed
+### 3. Add MCP configuration to Code-Agent (Claude, Agy, etc)
+Run on terminal:
+```shell
+claude mcp add --transport http vscode-pvs http://127.0.0.1:2222/mcp
+```
+
 # VSCode-PVS: An Integrated Development Environment for the Prototype Verification System
 
 [![license](https://img.shields.io/badge/license-NASA-blue.svg)](https://opensource.org/licenses/NASA-1.3)
