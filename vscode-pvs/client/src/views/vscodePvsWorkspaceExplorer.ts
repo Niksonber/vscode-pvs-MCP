@@ -56,6 +56,17 @@ import * as vscodeUtils from '../utils/vscode-utils';
 import { resolve } from 'path';
 import { getActivePvsFile } from '../utils/vscode-utils';
 
+export interface ProveTheoryProgressEvent {
+	phase: "preparing" | "running" | "completed" | "cancelled" | "failed";
+	theory: PvsTheory;
+	tccsOnly?: boolean;
+	total: number;
+	completed: number;
+	currentFormula?: string;
+	theorems: { theoryName: string; formulaName: string; status: ProofStatus; ms: number }[];
+	error?: string;
+}
+
 //-- files
 class PvsFileItem extends TreeItem {
 	contextValue: string = "pvs-file";
@@ -1031,12 +1042,24 @@ export class VSCodePvsWorkspaceExplorer extends Explorer { //implements TreeData
 		tccsOnly?: boolean,
 		useJprf?: boolean,
 		unprovedOnly?: boolean,
-		match?: RegExp // for now this is used when tccsOnly is true, to specify a subset of TCCs associated with a specific formula
-	}): Promise<void> {
+		match?: RegExp, // for now this is used when tccsOnly is true, to specify a subset of TCCs associated with a specific formula
+		onProgress?: (evt: ProveTheoryProgressEvent) => void,
+		cancellationToken?: CancellationToken
+	}): Promise<fsUtils.TheorySummary | null> {
 		if (desc && desc.theoryName) {
 			opt = opt || {};
+			const notifyProgress = (evt: ProveTheoryProgressEvent): void => {
+				try {
+					opt.onProgress?.({
+						...evt,
+						theorems: [...evt.theorems]
+					});
+				} catch (err) {
+					console.error("[vscode-pvs-explorer] Error in proveTheoryWithProgress onProgress callback", err);
+				}
+			};
 			// show dialog with progress
-			await window.withProgress({location: ProgressLocation.Notification, cancellable: true}, async (progress, token) => {
+			return await window.withProgress<fsUtils.TheorySummary | null>({location: ProgressLocation.Notification, cancellable: true}, async (progress, token) => {
 				// show initial dialog with spinning progress
 				const matchingFormula: string = opt.match?.source?.replace("_TCC", "");
 				let message: string = 
@@ -1047,14 +1070,45 @@ export class VSCodePvsWorkspaceExplorer extends Explorer { //implements TreeData
 					: `Preparing to prove theorems in theory ${desc.theoryName}`;
 				progress.report({ increment: -1, message });
 
-				const candidates: PvsFormula[] = (opt.tccsOnly) ? await this.getTccs(desc) : await this.getTheorems(desc);
+				let candidates: PvsFormula[] = [];
+				try {
+					candidates = (opt.tccsOnly) ? await this.getTccs(desc) : await this.getTheorems(desc);
+				} catch (e) {
+					candidates = [];
+				}
+				candidates = candidates || [];
 				// filter formulas if options specify a matching regex
 				const formulas: PvsFormula[] = (opt?.match) ? candidates.filter((formula: PvsFormula) => {
 						return new RegExp(opt.match).test(formula.formulaName);
 				}) : candidates;
+				// create summary template
+				const summary: fsUtils.TheorySummary = {
+					theoryName: desc.theoryName,
+					theorems: [],
+					tccsOnly: opt.tccsOnly,
+					total: (formulas) ? formulas.length : 0
+				};
+
+				notifyProgress({
+					phase: "preparing",
+					theory: desc,
+					tccsOnly: opt.tccsOnly,
+					total: summary.total,
+					completed: 0,
+					theorems: summary.theorems
+				});
+
 				if (opt.tccsOnly && matchingFormula && formulas?.length === 0) {
 					vscodeUtils.showInformationMessage(`Done! (No TCCs were generated for ${matchingFormula})`);
-					return resolve();
+					notifyProgress({
+						phase: "completed",
+						theory: desc,
+						tccsOnly: opt.tccsOnly,
+						total: 0,
+						completed: 0,
+						theorems: summary.theorems
+					});
+					return summary;
 				}
 				// keep track of which formulas were skipped (e.g., because they were already proved)
 				let skip: PvsFormula[] = [];
@@ -1071,36 +1125,59 @@ export class VSCodePvsWorkspaceExplorer extends Explorer { //implements TreeData
 					});
 					skip = proved;
 				}
-
-				// create summary template
-				const summary: fsUtils.TheorySummary = {
-					theoryName: desc.theoryName,
-					theorems: [],
-					tccsOnly: opt.tccsOnly,
-					total: (formulas) ? formulas.length : 0
-				};
 					
 				progress.report({ increment: -1, message });
 				// update the dialog
-				return new Promise<void>(async (resolve, reject) => {
-
-					this.pvsFailureHandler = (opt?: { msg?: string, fname?: string, method?: string, error_type?: string, src: string, log?: string }) => {
-							reject();
-					};
+				return new Promise<fsUtils.TheorySummary>(async (resolve, reject) => {
 
 					let stop: boolean = false;
+
+					this.pvsFailureHandler = (failureOpt?: { msg?: string, fname?: string, method?: string, error_type?: string, src: string, log?: string }) => {
+						stop = true;
+						commands.executeCommand('setContext', 'autorun', false);
+						notifyProgress({
+							phase: "failed",
+							theory: desc,
+							tccsOnly: opt.tccsOnly,
+							total: summary.total,
+							completed: summary.theorems.length,
+							theorems: summary.theorems,
+							error: failureOpt?.msg || "PVS failure during theory proof"
+						});
+						reject(failureOpt);
+					};
+
 					commands.executeCommand('setContext', 'autorun', true);
 					// show output panel for feedback
 					// commands.executeCommand("workbench.action.output.toggleOutput", true);
-					token.onCancellationRequested(async () => {
+					const handleCancel = async () => {
+						if (stop) {
+							return;
+						}
 						// stop loop
 						stop = true;
 						// stop proof explorer
 						commands.executeCommand("vscode-pvs.interrupt-and-quit-prover");
 						commands.executeCommand('setContext', 'autorun', false);
+						notifyProgress({
+							phase: "cancelled",
+							theory: desc,
+							tccsOnly: opt.tccsOnly,
+							total: summary.total,
+							completed: summary.theorems.length,
+							theorems: summary.theorems
+						});
 						// dispose of the dialog
-						resolve(null);
-					});
+						resolve(summary);
+					};
+					token.onCancellationRequested(handleCancel);
+					if (opt.cancellationToken) {
+						if (opt.cancellationToken.isCancellationRequested) {
+							await handleCancel();
+							return;
+						}
+						opt.cancellationToken.onCancellationRequested(handleCancel);
+					}
 					if (formulas && formulas.length) {
 						for (let i = 0; i < formulas.length && !stop; i ++) {
 							const formula: PvsFormula = formulas[i];
@@ -1114,6 +1191,15 @@ export class VSCodePvsWorkspaceExplorer extends Explorer { //implements TreeData
 								message
 							});
 							}
+							notifyProgress({
+								phase: "running",
+								theory: desc,
+								tccsOnly: opt.tccsOnly,
+								total: summary.total,
+								completed: summary.theorems.length,
+								currentFormula: formulaName,
+								theorems: summary.theorems
+							});
 							const start: number = new Date().getTime();
 							const status: ProofStatus =  skip.includes(formula) ? "proved" : await new Promise((resolve, reject) => {
 								const autorunRequest: string = (opt.useJprf) ? serverRequest.autorunFormulaFromJprf : serverRequest.autorunFormula;
@@ -1135,27 +1221,49 @@ export class VSCodePvsWorkspaceExplorer extends Explorer { //implements TreeData
 									}, 250);
 								});
 							});
+							if (stop) {
+								break;
+							}
 							const ms: number = new Date().getTime() - start;
 							summary.theorems.push({ theoryName, formulaName, status, ms });
+							notifyProgress({
+								phase: "running",
+								theory: desc,
+								tccsOnly: opt.tccsOnly,
+								total: summary.total,
+								completed: summary.theorems.length,
+								theorems: summary.theorems
+							});
 						}
 					}
-					commands.executeCommand('setContext', 'autorun', false);
-					this.client.sendRequest(serverRequest.getContextDescriptor, desc);
-					if (summary && summary.total) {
-						this.client.sendRequest(serverRequest.showTheorySummary, {
-							contextFolder: desc.contextFolder,
-							fileName: desc.fileName,
-							fileExtension: desc.fileExtension,
-							theoryName: desc.theoryName,
-							fileContent: fsUtils.makeTheorySummary(summary)
+					if (!stop) {
+						commands.executeCommand('setContext', 'autorun', false);
+						this.client.sendRequest(serverRequest.getContextDescriptor, desc);
+						if (summary && summary.total) {
+							this.client.sendRequest(serverRequest.showTheorySummary, {
+								contextFolder: desc.contextFolder,
+								fileName: desc.fileName,
+								fileExtension: desc.fileExtension,
+								theoryName: desc.theoryName,
+								fileContent: fsUtils.makeTheorySummary(summary)
+							});
+						} else {
+							// vscodeUtils.showInformationMessage(`0 proofs attempted`);
+						}
+						notifyProgress({
+							phase: "completed",
+							theory: desc,
+							tccsOnly: opt.tccsOnly,
+							total: summary.total,
+							completed: summary.theorems.length,
+							theorems: summary.theorems
 						});
-					} else {
-						// vscodeUtils.showInformationMessage(`0 proofs attempted`);
+						resolve(summary);
 					}
-					resolve();
 				});
 			});
 		}
+		return null;
 	}
 
 	/**

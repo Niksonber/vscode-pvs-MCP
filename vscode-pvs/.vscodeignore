@@ -58,10 +58,6 @@
 **/node_modules/denodeify
 **/node_modules/glob
 **/node_modules/fs.realpath
-**/node_modules/inflight
-**/node_modules/wrappy
-**/node_modules/inherits
-**/node_modules/once
 **/node_modules/path-is-absolute
 **/node_modules/leven
 **/node_modules/lodash

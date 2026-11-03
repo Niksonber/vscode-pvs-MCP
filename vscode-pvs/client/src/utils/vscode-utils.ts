@@ -943,8 +943,11 @@ export async function quickFixAddImporting (quickfix: QuickFixAddImporting): Pro
 /**
  * Utility function, extracts theory information from a resource
  */
-export async function getPvsTheory (resource: PvsFormula | PvsTheory | FormulaItem | TheoryItem | { path: string }): Promise<PvsTheory | null> {
+export async function getPvsTheory (resource: PvsFormula | PvsTheory | FormulaItem | TheoryItem | { path: string, theoryName?: string } | string): Promise<PvsTheory | null> {
 	if (resource) {
+        if (typeof resource === "string") {
+            resource = { path: resource };
+        }
         if ((<TheoryItem>resource)["contextValue"]) {
             return {
                 contextFolder: (<TheoryItem> resource).contextFolder,
@@ -952,19 +955,28 @@ export async function getPvsTheory (resource: PvsFormula | PvsTheory | FormulaIt
                 fileExtension: (<TheoryItem> resource).fileExtension,
                 theoryName: (<TheoryItem> resource).theoryName
             };    
-        } else if ((<{ path: string }>resource)["path"]) {
-            const resource_path: string = (<{ path: string }>resource).path;
+        } else if ((<{ path: string, theoryName?: string }>resource)["path"]) {
+            const resource_path: string = (<{ path: string, theoryName?: string }>resource).path;
             const content: string = await fsUtils.readFile(resource_path);
             if (content) {
                 const activeEditor: vscode.TextEditor = getActivePvsEditor();
-                const line: number = (activeEditor?.selection?.active) ?
+                const line: number = (activeEditor?.selection?.active && activeEditor?.document?.fileName === resource_path) ?
                     activeEditor.selection.active.line : 0;
-                const theoryName: string = fsUtils.findTheoryName(content, line);
+                let theoryName: string = (<{ path: string, theoryName?: string }>resource).theoryName;
+                if (!theoryName) {
+                    theoryName = fsUtils.findTheoryName(content, line);
+                }
+                if (!theoryName) {
+                    const match = content.match(/^\s*([a-zA-Z0-9_]+)\s*:\s*THEORY/m);
+                    if (match) {
+                        theoryName = match[1];
+                    }
+                }
                 return {
                     contextFolder: fsUtils.getContextFolder(resource_path),
                     fileName: fsUtils.getFileName(resource_path),
                     fileExtension: fsUtils.getFileExtension(resource_path),
-                    theoryName
+                    theoryName: theoryName || fsUtils.getFileName(resource_path)
                 };
             }
 		} else if ((<PvsTheory>resource)["contextFolder"]) {
@@ -976,12 +988,18 @@ export async function getPvsTheory (resource: PvsFormula | PvsTheory | FormulaIt
                     const activeEditor: vscode.TextEditor = getActivePvsEditor();
                     const line: number = (activeEditor?.selection?.active) ?
                         activeEditor.selection.active.line : 0;
-                    const theoryName: string = fsUtils.findTheoryName(content, line);
+                    let theoryName: string = fsUtils.findTheoryName(content, line);
+                    if (!theoryName) {
+                        const match = content.match(/^\s*([a-zA-Z0-9_]+)\s*:\s*THEORY/m);
+                        if (match) {
+                            theoryName = match[1];
+                        }
+                    }
                     return {
                         contextFolder: resource.contextFolder,
                         fileName: resource.fileName,
                         fileExtension: resource.fileExtension,
-                        theoryName
+                        theoryName: theoryName || resource.fileName
                     };
                 }
             }

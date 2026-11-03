@@ -36,10 +36,10 @@
  * TERMINATION OF THIS AGREEMENT.
  **/
 
-import { LanguageClient } from "vscode-languageclient";
+import { CancellationToken, LanguageClient } from "vscode-languageclient";
 import { VSCodePvsStatusBar } from "./views/vscodePvsStatusBar";
 import { VSCodePvsEmacsBindingsProvider } from "./providers/vscodePvsEmacsBindingsProvider";
-import { VSCodePvsWorkspaceExplorer, TheoryItem, TccsOverviewItem, WorkspaceOverviewItem, FormulaItem } from "./views/vscodePvsWorkspaceExplorer";
+import { VSCodePvsWorkspaceExplorer, TheoryItem, TccsOverviewItem, WorkspaceOverviewItem, FormulaItem, ProveTheoryProgressEvent } from "./views/vscodePvsWorkspaceExplorer";
 import { VSCodePvsProofExplorer, ProofItem, ProofExplorerEvent } from "./views/vscodePvsProofExplorer";
 // import { TerminalSession, VSCodePvsTerminal } from "./views/vscodePvsTerminal";
 import {
@@ -49,6 +49,7 @@ import {
     ProofExecInterruptAndQuitProver, FileDescriptor, ContextFolder,
     PvsioEvaluatorCommand, EvalExpressionRequest, ProveFormulaResponse,
     ProofCommandResponse, ProofMateProfile, ProveFormulaRequest, PvsFile,
+    EvaluatorCommandResponse,
     CopyProofliteRequest, SaveProofResponse, GotoFileDescriptor,
     FormulaDescriptor, quickFixReplaceCommand, QuickFixReplace, QuickFixAddImporting,
     quickFixAddImportingCommand, VSCodePvsVersionDescriptor, DumpPvsFilesRequest,
@@ -63,7 +64,7 @@ import * as fsUtils from './common/fsUtils';
 import { VSCodePvsProofMate } from "./views/vscodePvsProofMate";
 import * as utils from './common/languageUtils';
 import * as vscodeUtils from './utils/vscode-utils';
-import { VSCodePvsLogger } from "./views/vscodePvsLogger";
+import { PvsLogActor, PvsLogEntry, VSCodePvsLogger } from "./views/vscodePvsLogger";
 import { VSCodePvsPackageManager } from "./providers/vscodePvsPackageManager";
 import { VSCodePvsPlotter } from "./views/vscodePvsPlotter";
 import { VSCodePvsSearch } from "./views/vscodePvsSearch";
@@ -84,7 +85,7 @@ export class EventsDispatcher {
     public client: LanguageClient;
     protected statusBar: VSCodePvsStatusBar;
     protected emacsBindings: VSCodePvsEmacsBindingsProvider;
-    protected workspaceExplorer: VSCodePvsWorkspaceExplorer;
+    public workspaceExplorer: VSCodePvsWorkspaceExplorer;
     protected proofExplorer: VSCodePvsProofExplorer;
 
     // protected vscodePvsTerminal: VSCodePvsTerminal;
@@ -111,34 +112,565 @@ export class EventsDispatcher {
     protected pvsFailureHandlers: Array<(params: any) => void> = [];
     protected pathEvaluator: VSCodePvsPathEvaluator;
 
-    protected proofCommandResponseListeners: Array<(desc: ProofCommandResponse) => void> = [];
+    protected responseListeners: Map<string, Set<(desc: any) => void>> = new Map();
+    protected activeMcpDepth: number = 0;
 
-    public addProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void) {
-        this.proofCommandResponseListeners.push(cb);
+    public getLogger(): VSCodePvsLogger {
+        return this.logger;
     }
 
-    public removeProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void) {
-        this.proofCommandResponseListeners = this.proofCommandResponseListeners.filter(l => l !== cb);
+    public async runWithMcpContext<T>(fn: () => PromiseLike<T> | T): Promise<T> {
+        this.activeMcpDepth++;
+        try {
+            return await fn();
+        } finally {
+            this.activeMcpDepth = Math.max(0, this.activeMcpDepth - 1);
+        }
     }
 
-    protected proveFormulaResponseListeners: Array<(desc: ProveFormulaResponse) => void> = [];
-
-    public addProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void) {
-        this.proveFormulaResponseListeners.push(cb);
+    public getCurrentActor(hint?: any): PvsLogActor {
+        if (
+            hint?.origin === "mcp-server" ||
+            hint?.initiatedBy === "mcp" ||
+            this.activeMcpDepth > 0
+        ) {
+            return "mcp";
+        }
+        return "user";
     }
 
-    public removeProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void) {
-        this.proveFormulaResponseListeners = this.proveFormulaResponseListeners.filter(l => l !== cb);
+    protected sanitizeLogValue(val: any, depth: number = 0): any {
+        if (val === null || val === undefined) {
+            return val;
+        }
+        if (typeof val === "string") {
+            return val.length > 4000 ? val.substring(0, 4000) + "...[truncated]" : val;
+        }
+        if (typeof val === "number" || typeof val === "boolean") {
+            return val;
+        }
+        if (val instanceof RegExp) {
+            return val.toString();
+        }
+        if (depth > 3) {
+            return "[Object]";
+        }
+        if (Array.isArray(val)) {
+            return val.slice(0, 50).map(item => this.sanitizeLogValue(item, depth + 1));
+        }
+        if (typeof val === "object") {
+            if (typeof val.fsPath === "string") {
+                return { fsPath: val.fsPath, path: val.path };
+            }
+            const out: Record<string, any> = {};
+            const skipKeys = new Set(["fileContent", "cancellationToken", "parent", "children", "context", "client"]);
+            for (const key of Object.keys(val)) {
+                if (skipKeys.has(key) || typeof val[key] === "function") {
+                    continue;
+                }
+                out[key] = this.sanitizeLogValue(val[key], depth + 1);
+            }
+            return out;
+        }
+        return String(val);
     }
 
-    protected typecheckFileResponseListeners: Array<(desc: any) => void> = [];
-
-    public addTypecheckFileResponseListener(cb: (desc: any) => void) {
-        this.typecheckFileResponseListeners.push(cb);
+    protected sanitizeLogArgs(args: any[]): any {
+        const sanitized = args && args.length > 0 ? this.sanitizeLogValue(args) : [];
+        const activeFile = vscodeUtils.getActivePvsEditor()?.document?.fileName;
+        if ((!args || args.length === 0 || args[0] === undefined) && activeFile) {
+            return { args: sanitized, activeFile };
+        }
+        return sanitized;
     }
 
-    public removeTypecheckFileResponseListener(cb: (desc: any) => void) {
-        this.typecheckFileResponseListeners = this.typecheckFileResponseListeners.filter(l => l !== cb);
+    protected log(message: string, meta?: Partial<PvsLogEntry>): void {
+        console.log(message);
+        this.logger?.logConsole(message, {
+            source: "eventsDispatcher",
+            ...meta,
+            data: meta?.data !== undefined ? this.sanitizeLogValue(meta.data) : undefined
+        });
+    }
+
+    protected logError(message: string, error?: any, meta?: Partial<PvsLogEntry>): void {
+        if (error !== undefined) {
+            console.error(message, error);
+        } else {
+            console.error(message);
+        }
+        this.logger?.logError(message, error, {
+            source: "eventsDispatcher",
+            ...meta,
+            data: meta?.data !== undefined ? this.sanitizeLogValue(meta.data) : this.sanitizeLogValue(error)
+        });
+    }
+
+    protected registerCommand(commandId: string, callback: (...args: any[]) => any): vscode.Disposable {
+        const systemInternalCommands = new Set([
+            "vscode-pvs.ready",
+            "vscode-pvs.progress-info",
+            "xterm.showFeedbackWhileExecuting",
+            "xterm.did-execute-command",
+            "xterm-pvs.focus"
+        ]);
+        return commands.registerCommand(commandId, async (...args: any[]) => {
+            if (commandId !== "vscode-pvs.ignore-keypress") {
+                const hint = (args && (args[1]?.origin || args[1]?.initiatedBy)) ? args[1] : args?.[0];
+                const actor: PvsLogActor = systemInternalCommands.has(commandId)
+                    ? "system"
+                    : this.getCurrentActor(hint);
+                this.logger?.logEvent({
+                    level: "info",
+                    actor,
+                    source: "eventsDispatcher",
+                    event: "vscode.command",
+                    action: commandId,
+                    data: this.sanitizeLogArgs(args)
+                });
+            }
+            return await callback(...args);
+        });
+    }
+
+    protected addResponseListener<T>(event: string, cb: (desc: T) => void): void {
+        if (!this.responseListeners.has(event)) {
+            this.responseListeners.set(event, new Set());
+        }
+        this.responseListeners.get(event).add(cb);
+    }
+
+    protected removeResponseListener<T>(event: string, cb: (desc: T) => void): void {
+        this.responseListeners.get(event)?.delete(cb);
+    }
+
+    protected emitResponse<T>(event: string, data: T): void {
+        const listeners = this.responseListeners.get(event);
+        if (listeners) {
+            Array.from(listeners).forEach(listener => {
+                try {
+                    listener(data);
+                } catch (e) {
+                    console.error(`Error in ${event} listener`, e);
+                }
+            });
+        }
+    }
+
+    public waitForResponse<T>(
+        event: "proofCommandResponse" | "proveFormulaResponse" | "typecheckFileResponse" | "dischargeTccsResponse" | "proveTheoryResponse" | "evaluatorCommandResponse" | "pvsVersionInfo",
+        options?: {
+            timeoutMs?: number;
+            filter?: (data: T) => boolean;
+            abortOnFailToStartProof?: boolean;
+        }
+    ): Promise<T> {
+        const timeoutMs = options?.timeoutMs ?? 60000;
+        const abortOnReboot = event !== "pvsVersionInfo";
+        return new Promise<T>((resolve, reject) => {
+            let settled = false;
+            const cleanup = () => {
+                settled = true;
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                }
+                this.removeResponseListener(event, onResponse);
+                this.removePvsFailureListener(onFailure);
+                if (abortOnReboot) {
+                    this.removeResponseListener("pvsServerRebooting", onReboot);
+                }
+                if (options?.abortOnFailToStartProof) {
+                    this.removeProverEventListener(onProverEvent);
+                }
+            };
+
+            const onResponse = (data: T) => {
+                if (settled) { return; }
+                if (options?.filter && !options.filter(data)) {
+                    return;
+                }
+                cleanup();
+                resolve(data);
+            };
+
+            const onFailure = (params: any) => {
+                if (settled) { return; }
+                cleanup();
+                const errMsg = params?.msg || "PVS server failure occurred while waiting for response";
+                reject(new Error(errMsg));
+            };
+
+            const onReboot = (params: { msg?: string }) => {
+                if (settled) { return; }
+                cleanup();
+                reject(new Error(params?.msg || "PVS server was restarted while waiting for response"));
+            };
+
+            const onProverEvent = (desc: ProofEditEvent | ProofExecEvent) => {
+                if (settled) { return; }
+                if (desc?.action === "did-fail-to-start-proof") {
+                    cleanup();
+                    reject(new Error(desc.msg || "Failed to start prover session"));
+                }
+            };
+
+            const timeoutId = timeoutMs > 0 ? setTimeout(() => {
+                if (settled) { return; }
+                cleanup();
+                reject(new Error(`Timeout waiting for ${event} (${timeoutMs}ms)`));
+            }, timeoutMs) : null;
+
+            this.addResponseListener(event, onResponse);
+            this.addPvsFailureListener(onFailure);
+            if (abortOnReboot) {
+                this.addResponseListener("pvsServerRebooting", onReboot);
+            }
+            if (options?.abortOnFailToStartProof) {
+                this.addProverEventListener(onProverEvent);
+            }
+        });
+    }
+
+    public addPvsFailureListener(cb: (params: any) => void): void {
+        this.pvsFailureHandlers.push(cb);
+    }
+
+    public removePvsFailureListener(cb: (params: any) => void): void {
+        this.pvsFailureHandlers = this.pvsFailureHandlers.filter(l => l !== cb);
+    }
+
+    public addProverEventListener(cb: (desc: ProofEditEvent | ProofExecEvent) => void): void {
+        this.addResponseListener("proverEvent", cb);
+    }
+
+    public removeProverEventListener(cb: (desc: ProofEditEvent | ProofExecEvent) => void): void {
+        this.removeResponseListener("proverEvent", cb);
+    }
+
+    public addServerModeUpdateListener(cb: (desc: { mode: ServerMode }) => void): void {
+        this.addResponseListener("serverModeUpdateEvent", cb);
+    }
+
+    public removeServerModeUpdateListener(cb: (desc: { mode: ServerMode }) => void): void {
+        this.removeResponseListener("serverModeUpdateEvent", cb);
+    }
+
+    public addProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void): void {
+        this.addResponseListener("proofCommandResponse", cb);
+    }
+
+    public removeProofCommandResponseListener(cb: (desc: ProofCommandResponse) => void): void {
+        this.removeResponseListener("proofCommandResponse", cb);
+    }
+
+    public addProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void): void {
+        this.addResponseListener("proveFormulaResponse", cb);
+    }
+
+    public removeProveFormulaResponseListener(cb: (desc: ProveFormulaResponse) => void): void {
+        this.removeResponseListener("proveFormulaResponse", cb);
+    }
+
+    public addTypecheckFileResponseListener(cb: (desc: any) => void): void {
+        this.addResponseListener("typecheckFileResponse", cb);
+    }
+
+    public removeTypecheckFileResponseListener(cb: (desc: any) => void): void {
+        this.removeResponseListener("typecheckFileResponse", cb);
+    }
+
+    public addDischargeTccsResponseListener(cb: (desc: any) => void): void {
+        this.addResponseListener("dischargeTccsResponse", cb);
+    }
+
+    public removeDischargeTccsResponseListener(cb: (desc: any) => void): void {
+        this.removeResponseListener("dischargeTccsResponse", cb);
+    }
+
+    public addEvaluatorCommandResponseListener(cb: (desc: EvaluatorCommandResponse) => void): void {
+        this.addResponseListener("evaluatorCommandResponse", cb);
+    }
+
+    public removeEvaluatorCommandResponseListener(cb: (desc: EvaluatorCommandResponse) => void): void {
+        this.removeResponseListener("evaluatorCommandResponse", cb);
+    }
+
+    public addProveTheoryProgressListener(cb: (desc: ProveTheoryProgressEvent) => void): void {
+        this.addResponseListener("proveTheoryProgress", cb);
+    }
+
+    public removeProveTheoryProgressListener(cb: (desc: ProveTheoryProgressEvent) => void): void {
+        this.removeResponseListener("proveTheoryProgress", cb);
+    }
+
+    public addProveTheoryResponseListener(cb: (desc: { theory: PvsTheory; summary: fsUtils.TheorySummary | null; tccsOnly?: boolean; cancelled?: boolean; error?: string }) => void): void {
+        this.addResponseListener("proveTheoryResponse", cb);
+    }
+
+    public removeProveTheoryResponseListener(cb: (desc: { theory: PvsTheory; summary: fsUtils.TheorySummary | null; tccsOnly?: boolean; cancelled?: boolean; error?: string }) => void): void {
+        this.removeResponseListener("proveTheoryResponse", cb);
+    }
+
+    public addPvsVersionInfoListener(cb: (desc: PvsVersionDescriptor) => void): void {
+        this.addResponseListener("pvsVersionInfo", cb);
+    }
+
+    public removePvsVersionInfoListener(cb: (desc: PvsVersionDescriptor) => void): void {
+        this.removeResponseListener("pvsVersionInfo", cb);
+    }
+
+    public addPvsServerRebootingListener(cb: (desc: { msg?: string }) => void): void {
+        this.addResponseListener("pvsServerRebooting", cb);
+    }
+
+    public removePvsServerRebootingListener(cb: (desc: { msg?: string }) => void): void {
+        this.removeResponseListener("pvsServerRebooting", cb);
+    }
+
+    public getPvsLibraryPathsInfo(opt?: { includeSubfolders?: boolean }): {
+        pvs_path: string;
+        pvs_path_exists: boolean;
+        prelude: {
+            path: string | null;
+            exists: boolean;
+            main_file: string | null;
+            main_file_exists: boolean;
+            pvsio_file: string | null;
+            subfolders?: string[];
+        };
+        nasalib: {
+            path: string | null;
+            exists: boolean;
+            subfolders?: string[];
+        };
+        pvs_library_paths: { path: string; exists: boolean }[];
+        workspace_path: string | null;
+    } {
+        const includeSubfolders = opt?.includeSubfolders ?? true;
+        const rawPvsPath = vscodeUtils.getConfiguration("pvs.path")?.trim() || "";
+        const pvsPath = rawPvsPath ? fsUtils.tildeExpansion(rawPvsPath) : "";
+        const pvsPathExists = !!(pvsPath && fsUtils.folderExists(pvsPath));
+
+        const preludePath = pvsPath ? path.join(pvsPath, "lib") : null;
+        const preludeExists = !!(preludePath && fsUtils.folderExists(preludePath));
+        const preludeMainFile = preludePath ? path.join(preludePath, "prelude.pvs") : null;
+        const preludeMainFileExists = !!(preludeMainFile && fsUtils.fileExists(preludeMainFile));
+        const preludePvsioFile = preludePath ? path.join(preludePath, "pvsio_prelude.pvs") : null;
+
+        const configuredLibPaths = vscodeUtils.getPvsLibraryPaths();
+        const envLibPaths = (process.env["PVS_LIBRARY_PATH"] || "")
+            .split(path.delimiter)
+            .map(p => p.trim())
+            .filter(Boolean);
+        const allLibPathsSet = new Set<string>();
+        for (const p of [...configuredLibPaths, ...envLibPaths]) {
+            const expanded = fsUtils.tildeExpansion(p);
+            if (expanded) {
+                allLibPathsSet.add(expanded);
+            }
+        }
+        const allLibPaths = Array.from(allLibPathsSet);
+
+        let nasalibPath: string | null =
+            fsUtils.getNasalibPath(vscodeUtils.getPvsLibraryPath()) ||
+            fsUtils.getNasalibPath(process.env["PVS_LIBRARY_PATH"] || "") ||
+            null;
+
+        if (!nasalibPath && pvsPath) {
+            const bundledNasalib = path.join(pvsPath, "nasalib");
+            if (fsUtils.folderExists(bundledNasalib)) {
+                nasalibPath = bundledNasalib;
+            }
+        }
+
+        if (!nasalibPath) {
+            for (const candidate of allLibPaths) {
+                if (!fsUtils.folderExists(candidate)) continue;
+                if (path.basename(candidate.replace(/\/+$/, "")).toLowerCase() === "nasalib") {
+                    nasalibPath = candidate;
+                    break;
+                }
+                const pvsLibContent = fsUtils.readFile(path.join(candidate, ".pvslib"));
+                if (pvsLibContent && /id:\s*NASALib/i.test(pvsLibContent)) {
+                    nasalibPath = candidate;
+                    break;
+                }
+            }
+        }
+
+        const nasalibExists = !!(nasalibPath && fsUtils.folderExists(nasalibPath));
+
+        const listCleanSubfolders = (dirPath: string | null, exists: boolean): string[] | undefined => {
+            if (!includeSubfolders) return undefined;
+            if (!dirPath || !exists) return [];
+            const folders = fsUtils.listSubFolders(dirPath) || [];
+            return folders
+                .filter(name => name && !name.startsWith("."))
+                .sort((a, b) => a.localeCompare(b));
+        };
+
+        const workspacePath = this.workspaceExplorer?.getCurrentWorkspace() || vscodeUtils.getRootFolder() || null;
+
+        return {
+            pvs_path: pvsPath,
+            pvs_path_exists: pvsPathExists,
+            prelude: {
+                path: preludePath,
+                exists: preludeExists,
+                main_file: preludeMainFile,
+                main_file_exists: preludeMainFileExists,
+                pvsio_file: preludePvsioFile,
+                ...(includeSubfolders ? { subfolders: listCleanSubfolders(preludePath, preludeExists) } : {})
+            },
+            nasalib: {
+                path: nasalibPath,
+                exists: nasalibExists,
+                ...(includeSubfolders ? { subfolders: listCleanSubfolders(nasalibPath, nasalibExists) } : {})
+            },
+            pvs_library_paths: allLibPaths.map(p => ({
+                path: p,
+                exists: fsUtils.folderExists(p)
+            })),
+            workspace_path: workspacePath
+        };
+    }
+
+    protected async resolveActiveResource<T>(resource: T, opt?: { save?: boolean }): Promise<T | { path: string }> {
+        const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
+        if (activeEditor?.document) {
+            if (opt?.save) {
+                await activeEditor.document.save();
+            }
+            if (!resource) {
+                return { path: activeEditor.document.fileName };
+            }
+        }
+        return resource;
+    }
+
+    protected async executeTheoryProof(
+        desc: PvsTheory,
+        opt: {
+            tccsOnly?: boolean;
+            useJprf?: boolean;
+            unprovedOnly?: boolean;
+            match?: RegExp;
+            progressMsg: string;
+            cancellationToken?: CancellationToken;
+        }
+    ): Promise<fsUtils.TheorySummary | null> {
+        this.quietMode = true;
+        this.proofMate.disableView();
+        this.proofExplorer.disableView();
+        this.xterm.bye();
+        this.statusBar.showProgress(opt.progressMsg);
+
+        let lastPhase = "preparing" as ProveTheoryProgressEvent["phase"];
+        let lastError: string | undefined;
+
+        try {
+            const summary = await this.workspaceExplorer.proveTheoryWithProgress(desc, {
+                tccsOnly: opt.tccsOnly,
+                useJprf: opt.useJprf,
+                unprovedOnly: opt.unprovedOnly,
+                match: opt.match,
+                cancellationToken: opt.cancellationToken,
+                onProgress: (evt) => {
+                    lastPhase = evt.phase;
+                    if (evt.error) {
+                        lastError = evt.error;
+                    }
+                    this.logger?.logEvent({
+                        level: evt.phase === "failed" ? "error" : "info",
+                        actor: "server",
+                        source: "eventsDispatcher",
+                        event: "proveTheoryProgress",
+                        action: evt.phase,
+                        data: this.sanitizeLogValue(evt)
+                    });
+                    this.emitResponse("proveTheoryProgress", evt);
+                }
+            });
+            const responseEventName = opt.tccsOnly ? "dischargeTccsResponse" : "proveTheoryResponse";
+            const payload = {
+                theory: desc,
+                summary,
+                tccsOnly: opt.tccsOnly,
+                cancelled: lastPhase === "cancelled",
+                error: lastError
+            };
+            this.logger?.logEvent({
+                level: lastError ? "error" : "info",
+                actor: "server",
+                source: "eventsDispatcher",
+                event: responseEventName,
+                action: lastPhase,
+                data: this.sanitizeLogValue(payload)
+            });
+            this.emitResponse(responseEventName, payload);
+            return summary;
+        } catch (error: any) {
+            const errMsg = error?.msg || error?.message || String(error || "Unknown error during theory proof");
+            const responseEventName = opt.tccsOnly ? "dischargeTccsResponse" : "proveTheoryResponse";
+            const payload = {
+                theory: desc,
+                summary: null,
+                tccsOnly: opt.tccsOnly,
+                cancelled: false,
+                error: errMsg
+            };
+            this.logger?.logEvent({
+                level: "error",
+                actor: "server",
+                source: "eventsDispatcher",
+                event: responseEventName,
+                action: "failed",
+                data: this.sanitizeLogValue(payload)
+            });
+            this.emitResponse(responseEventName, payload);
+            return null;
+        } finally {
+            this.statusBar.clear();
+            this.statusBar.ready();
+            this.quietMode = false;
+        }
+    }
+
+    protected async executeDischargeTccs(
+        desc: PvsTheory,
+        opt: { useJprf?: boolean; unprovedOnly?: boolean; match?: RegExp; progressMsg: string; cancellationToken?: CancellationToken }
+    ): Promise<fsUtils.TheorySummary | null> {
+        return await this.executeTheoryProof(desc, {
+            ...opt,
+            tccsOnly: true
+        });
+    }
+
+    protected async sendActiveEditorLatexRequest(requestType: string, resource?: any): Promise<void> {
+        const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
+        if (activeEditor?.document) {
+            await activeEditor.document.save();
+
+            const fname: string = activeEditor.document.fileName;
+            const cursorPosition: vscode.Position = activeEditor.selection?.active;
+            const text: string = activeEditor.document.getText();
+
+            const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor({
+                theoryName: findTheoryName(text, cursorPosition ? cursorPosition.line : 0),
+                formulaName: null,
+                fileName: fsUtils.getFileName(fname),
+                fileExtension: fsUtils.getFileExtension(fname),
+                contextFolder: fsUtils.getContextFolder(fname)
+            });
+
+            if (isPvsFile(desc)) {
+                this.client.sendRequest(requestType, desc);
+            } else {
+                showWarningMessage(`Tried to latexify a non 'pvs' file.`);
+            }
+        } else {
+            this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
+        }
     }
 
     constructor (client: LanguageClient, handlers: {
@@ -189,16 +721,18 @@ export class EventsDispatcher {
     }
 	activate (context: ExtensionContext): void {
         // -- handlers for server responses
-        this.client.onRequest(serverEvent.evaluatorCommandResponse, (data: {
-            req: PvsioEvaluatorCommand,
-            res: string,
-            state: string
-        }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.evaluatorCommandResponse} - param: ${data}`); //DEBUG
-            // do nothing -- this is just a placeholder, the actual handler is in vscodePvsioWeb.ts
+        this.client.onRequest(serverEvent.evaluatorCommandResponse, (data: EvaluatorCommandResponse) => {
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.evaluatorCommandResponse} - param: ${JSON.stringify(data)}`,
+                { actor: "server", event: serverEvent.evaluatorCommandResponse, data }
+            );
+            this.emitResponse("evaluatorCommandResponse", data);
         });
 		this.client.onRequest(serverEvent.pvsVersionInfo, async (version: PvsVersionDescriptor) => {
-		  console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.pvsVersionInfo} - param: ${version} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.pvsVersionInfo} - param: ${version} `,
+                { actor: "server", event: serverEvent.pvsVersionInfo, data: version }
+            ); // #DEBUG
 			if (version) {
                 this.statusBar.pvsReady(version);
                 vscode.commands.executeCommand('setContext', 'nasalib-present', !!version["nasalib-version"]);
@@ -245,14 +779,18 @@ export class EventsDispatcher {
                         vscodeUtils.showActiveFileInExplorer();
                     }
                 } catch (err) {
-                    console.error(`[event-dispatcher] Error while trying to open new workspace`, err);
+                    this.logError(`[event-dispatcher] Error while trying to open new workspace`, err);
                 } finally {
                     this.statusBar.showVersionDialog({ trailingNote: " :: Ready! ::"});
+                    this.emitResponse("pvsVersionInfo", version);
                 }
 			}
 		});
 		this.client.onRequest(serverEvent.contextUpdate, (desc: PvsContextDescriptor) => {
-		  console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.contextUpdate} - param: ${JSON.stringify(desc)} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.contextUpdate} - param: ${JSON.stringify(desc)} `,
+                { actor: "server", event: serverEvent.contextUpdate, data: desc }
+            ); // #DEBUG
 			if (this.workspaceExplorer) {
 				this.workspaceExplorer.updateContextFolder(desc, { theoriesFromActiveFile: this.showTheoriesFromActiveFile });
 			}
@@ -265,7 +803,10 @@ export class EventsDispatcher {
                 contextFolder: string
             }
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.latexTheoriesResponse} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.latexTheoriesResponse} - param: ${desc} `,
+                { actor: "server", event: serverEvent.latexTheoriesResponse, data: desc }
+            ); // #DEBUG
             if(desc.response?.result && desc.response.result["main-file"] ){
                 const mainFile: string = desc.response.result["main-file"];
                 const mainFileFolder: string = path.dirname(mainFile);
@@ -285,7 +826,10 @@ export class EventsDispatcher {
                 contextFolder: string
             }
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.typecheckFileResponse} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.typecheckFileResponse} - param: ${desc} `,
+                { actor: "server", event: serverEvent.typecheckFileResponse, data: desc }
+            ); // #DEBUG
             // request tccs for the files that typecheck correctly
             if (desc && desc.response && desc.response.result && desc.args) {
                 this.client.sendRequest(serverRequest.generateTccs, {
@@ -295,13 +839,7 @@ export class EventsDispatcher {
                     quiet: true
                 });
             }
-            this.typecheckFileResponseListeners.forEach(listener => {
-                try {
-                    listener(desc);
-                } catch (e) {
-                    console.error("Error in typecheck", e);
-                }
-            });
+            this.emitResponse("typecheckFileResponse", desc);
         });
         this.client.onNotification(serverRequest.generateTccs, (desc: {
             response: PvsContextDescriptor,
@@ -319,7 +857,10 @@ export class EventsDispatcher {
             response: PvsContextDescriptor,
             args: FileDescriptor
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverRequest.showTccs} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverRequest.showTccs} - param: ${desc} `,
+                { actor: "server", event: serverRequest.showTccs, data: desc }
+            ); // #DEBUG
             if (this.workspaceExplorer && desc?.response) {
                 this.workspaceExplorer.updateContextFolder(desc.response, { tccDescriptor: true, theoriesFromActiveFile: this.showTheoriesFromActiveFile });
             }
@@ -332,7 +873,10 @@ export class EventsDispatcher {
             }
         });
 		this.client.onRequest(serverEvent.parseFileResponse, (res: PvsResponse) => {
-		  console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.parseFileResponse} - param: ${res} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.parseFileResponse} - param: ${res} `,
+                { actor: "server", event: serverEvent.parseFileResponse, data: res }
+            ); // #DEBUG
             // show stats
             if (res && res["math-objects"] && res.contextFolder && res.fileName) {
                 // display info in the status bar
@@ -341,7 +885,10 @@ export class EventsDispatcher {
             }
         });
 		this.client.onRequest(serverEvent.workspaceStats, (res: PvsResponse) => {
-		  console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.workspaceStats} - param: ${res} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.workspaceStats} - param: ${res} `,
+                { actor: "server", event: serverEvent.workspaceStats, data: res }
+            ); // #DEBUG
             // show stats
             if (res) {
                 if (res["contextFolder"]) {
@@ -355,7 +902,10 @@ export class EventsDispatcher {
             }
         });
         this.client.onRequest(serverEvent.proofCommandResponse, async (desc: ProofCommandResponse) => {
-          console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.proofCommandResponse} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.proofCommandResponse} - param: ${desc} `,
+                { actor: "server", event: serverEvent.proofCommandResponse, data: desc }
+            ); // #DEBUG
             // notify proofexplorer
             // await this.proofExplorer.onStepExecuted(desc);
             if (desc?.res && typeof desc.res !== "string") {
@@ -363,17 +913,19 @@ export class EventsDispatcher {
                 this.proofMate.updateRecommendations(desc.res);
             }
             // Trigger listeners
-            this.proofCommandResponseListeners.forEach(listener => {
-                try {
-                    listener(desc);
-                } catch (e) {
-                    console.error("Error in proofCommandResponseListener", e);
-                }
-            });
+            this.emitResponse("proofCommandResponse", desc);
         });
 
         //----------------
         this.client.onNotification(serverEvent.workspaceEvent, (desc: WorkspaceEvent) => {
+            this.logger?.logEvent({
+                level: "info",
+                actor: "server",
+                source: "eventsDispatcher",
+                event: serverEvent.workspaceEvent,
+                action: desc?.action,
+                data: this.sanitizeLogValue(desc)
+            });
             switch (desc.action) {
                 case "did-rename-file": {
                     const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor()
@@ -394,6 +946,14 @@ export class EventsDispatcher {
 
         //----------------
         this.client.onNotification(serverEvent.proverEvent, (desc: ProofEditEvent | ProofExecEvent) => {
+            this.logger?.logEvent({
+                level: desc?.action === "did-fail-to-start-proof" ? "error" : "info",
+                actor: "server",
+                source: "eventsDispatcher",
+                event: serverEvent.proverEvent,
+                action: desc?.action,
+                data: this.sanitizeLogValue(desc)
+            });
 			switch (desc.action) {
 				case "did-append-node": {
                     this.proofExplorer.didAppendNode(desc);
@@ -545,6 +1105,7 @@ export class EventsDispatcher {
                     break;
                 }
             }
+            this.emitResponse("proverEvent", desc);
         });
 
         // register handler that will resolve the promise when the proof needs to be saved
@@ -559,6 +1120,13 @@ export class EventsDispatcher {
                 proofDescriptor: ProofDescriptor
             }
         }) => {
+            this.logger?.logEvent({
+                level: desc?.response?.success ? "info" : "error",
+                actor: "server",
+                source: "eventsDispatcher",
+                event: serverRequest.saveProof,
+                data: this.sanitizeLogValue(desc)
+            });
             if (desc?.response?.success && desc?.response?.proofFile && desc?.response?.formula) {
                 // const fname: string = fsUtils.desc2fname(desc.response.proofFile);
                 if (!this.quietMode) {
@@ -602,7 +1170,10 @@ export class EventsDispatcher {
 
 
         this.client.onRequest(serverEvent.proveFormulaResponse, (desc: ProveFormulaResponse) => {
-          console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.proveFormulaResponse} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.proveFormulaResponse} - param: ${desc} `,
+                { actor: "server", event: serverEvent.proveFormulaResponse, data: desc }
+            ); // #DEBUG
             // console.log(`[${fsUtils.generateTimestamp()}] `+desc);
             // if (desc) {
             //     // initialise proof explorer
@@ -620,17 +1191,14 @@ export class EventsDispatcher {
             //     // this.proofExplorer.startProof();
             //     this.proofMate.startProof();
             // }
-            this.proveFormulaResponseListeners.forEach(listener => {
-                try {
-                    listener(desc);
-                } catch (e) {
-                    console.error("Error in proveFormulaResponseListener", e);
-                }
-            });
+            this.emitResponse("proveFormulaResponse", desc);
         });
 
         this.client.onRequest(serverEvent.pvsServerFail, (desc: { msg?: string }) => {
-          console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.pvsServerFail} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.pvsServerFail} - param: ${desc} `,
+                { level: "error", actor: "server", event: serverEvent.pvsServerFail, data: desc }
+            ); // #DEBUG
             desc = desc || {};
             if (desc.msg) {
                 this.statusBar.failure(desc.msg);
@@ -638,7 +1206,10 @@ export class EventsDispatcher {
         });
 
         this.client.onRequest(serverEvent.serverModeUpdateEvent, (desc: { mode: ServerMode }) => {
-          console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.serverModeUpdateEvent} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.serverModeUpdateEvent} - param: ${desc} `,
+                { actor: "server", event: serverEvent.serverModeUpdateEvent, data: desc }
+            ); // #DEBUG
             if (desc) {
                 switch (desc.mode) {
                     case "in-checker": {
@@ -668,6 +1239,7 @@ export class EventsDispatcher {
                 }
                 this.proofExplorer.didUpdateServerMode(desc.mode);
                 this.workspaceExplorer.refreshView();
+                this.emitResponse("serverModeUpdateEvent", desc);
             }
         });
 
@@ -693,7 +1265,10 @@ export class EventsDispatcher {
             response: { result: "Q.E.D." },
             request: PvsProofCommand
 		}) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.QED} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.QED} - param: ${desc} `,
+                { actor: "server", event: serverEvent.QED, data: desc }
+            ); // #DEBUG
             // annotate pvs file with @QED at the formula location
             console.log(`[${fsUtils.generateTimestamp()}] `+desc);
             const flag: boolean = vscodeUtils.getConfigurationFlag("pvs.settings.prover.@QED");
@@ -713,7 +1288,10 @@ export class EventsDispatcher {
             response: FileDescriptor,
             args: PvsTheory
         }) => {
-            console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.showTheorySummaryResponse} - param: ${desc} `); // #DEBUG
+            this.log(
+                `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.showTheorySummaryResponse} - param: ${desc} `,
+                { actor: "server", event: serverEvent.showTheorySummaryResponse, data: desc }
+            ); // #DEBUG
             if (desc && desc.response) {
                 vscodeUtils.showTextDocument(desc.response);
             }
@@ -732,19 +1310,19 @@ export class EventsDispatcher {
         // commands invoked using code lens, emacs bindings, explorer, etc
         //---------------------------------------------------------
 
-        context.subscriptions.push(commands.registerCommand(quickFixAddImportingCommand, async (desc: QuickFixAddImporting): Promise<boolean> => {
+        context.subscriptions.push(this.registerCommand(quickFixAddImportingCommand, async (desc: QuickFixAddImporting): Promise<boolean> => {
             if (desc?.newImporting && desc?.position && desc?.fileName && desc?.fileExtension) {
                 return await quickFixAddImporting(desc);
             }
             return false;
         }));
-        context.subscriptions.push(commands.registerCommand(quickFixReplaceCommand, async (desc: QuickFixReplace): Promise<boolean> => {
+        context.subscriptions.push(this.registerCommand(quickFixReplaceCommand, async (desc: QuickFixReplace): Promise<boolean> => {
             if (desc?.newText && desc?.range && desc?.fileName && desc?.fileExtension) {
                 return await quickFixReplace(desc);
             }
             return false;
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.insert-prooflite-script", async (desc: PvsFormula) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.insert-prooflite-script", async (desc: PvsFormula) => {
             if (!(desc.fileName && desc.fileExtension && desc.contextFolder && desc.theoryName && desc.formulaName)) {
                 const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
                 const document: vscode.TextDocument = activeEditor?.document;
@@ -774,64 +1352,67 @@ export class EventsDispatcher {
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.progress-info", (msg: string) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.progress-info", (msg: string) => {
             this.statusBar.showProgress(msg);
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.comment-prooflite-line", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.comment-prooflite-line", () => {
             vscodeUtils.commentProofliteInActiveEditor();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.search-nasalib", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.search-nasalib", () => {
             this.search.reveal(); // async call
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.view-prelude-file", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.view-prelude-file", () => {
             this.client.sendRequest(serverRequest.viewPreludeFile);
             this.client.onRequest(serverEvent.viewPreludeFileResponse, (desc: PvsFile) => {
-              console.log(`[${fsUtils.generateTimestamp()}] `+`[eventsDispatcher] responding request ${serverEvent.viewPreludeFileResponse} - param: ${desc} `); // #DEBUG
+                this.log(
+                    `[${fsUtils.generateTimestamp()}] ` + `[eventsDispatcher] responding request ${serverEvent.viewPreludeFileResponse} - param: ${desc} `,
+                    { actor: "server", event: serverEvent.viewPreludeFileResponse, data: desc }
+                ); // #DEBUG
                 vscodeUtils.showTextDocument(desc);
             });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.update-pvs", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.update-pvs", async () => {
             await this.packageManager.pvsInstallationWizard({ update: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.select-pvs-path", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.select-pvs-path", async () => {
             await this.packageManager.pvsInstallationWizard({
 				msg: `Please choose one of the following actions.\n`,
 				update: true,
 				preferDefaultFolder: true
 			});
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.open-vscode-pvs-settings", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.open-vscode-pvs-settings", async () => {
             vscodeUtils.openVscodePvsSettings();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.set-pvs-path", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.set-pvs-path", () => {
             this.packageManager.choosePvsPath();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.install-nasalib", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.install-nasalib", () => {
             this.statusBar.hideDownloadNasalibButton();
             this.packageManager.nasalibInstallationWizard();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.update-nasalib", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.update-nasalib", () => {
             this.statusBar.hideDownloadNasalibButton();
             this.packageManager.nasalibInstallationWizard({ update: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.add-pvs-library", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.add-pvs-library", async () => {
             await vscodeUtils.addPvsLibraryFolderWizard();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.reset-pvs-library-path", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.reset-pvs-library-path", async () => {
             await vscodeUtils.clearPvsLibraryPath();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.view-pvs-library-path", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.view-pvs-library-path", async () => {
             commands.executeCommand('workbench.action.openSettings', `${vscodeUtils.extensionName} pvs-library-path`);
         }));
         // vscode-pvs.send-proof-command
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.send-proof-command", (desc: PvsProofCommand) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.send-proof-command", (desc: PvsProofCommand) => {
             this.client.sendRequest(serverRequest.proofCommand, desc);
             this.xterm.showFeedbackWhileExecuting(desc?.cmd || "");
         }));
-        context.subscriptions.push(commands.registerCommand("xterm.showFeedbackWhileExecuting", (desc: { cmd: string, target?: string }) => {
+        context.subscriptions.push(this.registerCommand("xterm.showFeedbackWhileExecuting", (desc: { cmd: string, target?: string }) => {
             this.xterm.showFeedbackWhileExecuting(desc?.cmd, desc?.target);
         }));
-        context.subscriptions.push(commands.registerCommand("xterm.did-execute-command", (desc: { cmd: string, target?: string }) => {
+        context.subscriptions.push(this.registerCommand("xterm.did-execute-command", (desc: { cmd: string, target?: string }) => {
             if (!this.proofExplorer.isRunning() && !this.proofMate.isRunning()) {
                 this.xterm.running(false);
                 this.xterm.showWelcomeMessage();
@@ -842,57 +1423,71 @@ export class EventsDispatcher {
                 this.statusBar.running(true);
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.select-profile", (desc: { profile: ProofMateProfile }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.select-profile", (desc: { profile: ProofMateProfile }) => {
             // this.vscodePvsTerminal.selectProfile(desc);
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.new-pvs-file", async (resource: { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.new-pvs-file", async (resource: { path: string }) => {
             const activeFolder: string = fsUtils.getContextFolder(vscodeUtils.getActivePvsFile()?.fileName) || vscodeUtils.getRootPath();
             const contextFolder: string = resource?.path || activeFolder;
-            console.log(`[${fsUtils.generateTimestamp()}] `+contextFolder);
+            this.log(`[${fsUtils.generateTimestamp()}] ` + contextFolder, {
+                actor: this.getCurrentActor(resource),
+                event: "vscode-pvs.new-pvs-file",
+                data: { contextFolder }
+            });
             this.workspaceExplorer.newPvsFileDialog(contextFolder); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.new-pvs-theory", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.new-pvs-theory", async () => {
             this.workspaceExplorer.newPvsTheoryDialog(); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.open-pvs-file", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.open-pvs-file", async () => {
             this.workspaceExplorer.openPvsFile(); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.goto-pvs-file", async (desc: GotoFileDescriptor) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.goto-pvs-file", async (desc: GotoFileDescriptor) => {
             this.workspaceExplorer.openPvsFile(desc, { preserveFocus: false}); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.open-pvs-file-or-folder", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.open-pvs-file-or-folder", async () => {
             await this.workspaceExplorer.openPvsFileOrFolder();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.open-pvs-workspace", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.open-pvs-workspace", async () => {
             this.workspaceExplorer.openWorkspace(); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.clean-pvs-workspace", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.clean-pvs-workspace", async () => {
             this.workspaceExplorer.cleanPvsWorkspace(); // async method
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-version-info", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-version-info", () => {
             // this.statusBar.showVersionInfo();
             this.statusBar.showVersionDialog({ downloadButtons: false });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-version-dialog", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-version-dialog", () => {
             this.statusBar.showVersionDialog({ downloadButtons: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.reboot-pvs", async (info?: string) => {
-            // ask the user confirmation before restarting pvs
+        context.subscriptions.push(this.registerCommand("vscode-pvs.reboot-pvs", async (arg?: string | { info?: string; force?: boolean; cleanFolder?: boolean }) => {
+            const opt = typeof arg === "string" ? { info: arg } : (arg || {});
+            // ask the user confirmation before restarting pvs unless force is true
 			const yesNo: string[] = [ "Yes", "No" ];
-			const msg: string = info || `Reboot pvs?\n\nThis action can resolve situations where the server crashed or is not responding.`;
-			const ans: string | undefined = await vscode.window.showInformationMessage(msg, { modal: true }, yesNo[0])
+			const msg: string = opt.info || `Reboot pvs?\n\nThis action can resolve situations where the server crashed or is not responding.`;
+			const ans: string | undefined = opt.force ? yesNo[0] : await vscode.window.showInformationMessage(msg, { modal: true }, yesNo[0]);
 			if (ans === yesNo[0]) {
+                if (opt.cleanFolder) {
+                    await vscodeUtils.cleanPvsWorkspace();
+                }
                 const currentContext: string = vscodeUtils.getRootPath();
                 const req = {
-                    cleanFolder: currentContext,
+                    cleanFolder: opt.cleanFolder ? currentContext : undefined,
                     externalServer: vscodeUtils.getConfigurationFlag("pvs.externalServer"),
-                    webSocketPort: vscodeUtils.getConfigurationValue("pvs.initialPortNumber") };
+                    webSocketPort: vscodeUtils.getConfigurationValue("pvs.initialPortNumber")
+                };
+                // Cancel any active prove-theory execution and unblock waiting responses
+                this.emitResponse("pvsServerRebooting", { msg: "PVS server was restarted" });
+                this.workspaceExplorer?.pvsFailureHandler?.({ msg: "PVS server was restarted", src: "reboot-pvs" });
                 this.client.sendRequest(serverRequest.rebootPvsServer, req);
-                // terminate any prover session
-                this.xterm.dispose();
+                // terminate any prover/evaluator session and reset views
+                this.proofExplorer?.disposeView();
+                this.proofMate?.disposeView();
+                this.xterm?.dispose();
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.interrupt-prover", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.interrupt-prover", async () => {
             // ask the user confirmation before restarting pvs
             if (this.proofExplorer.isRunning()) {
                 this.proofExplorer.queryPauseProof();
@@ -906,25 +1501,25 @@ export class EventsDispatcher {
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.interrupt-pvs", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.interrupt-pvs", async () => {
             commands.executeCommand("vscode-pvs.reboot-pvs", "Interrupt the execution of the current PVS command?");
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.ready", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.ready", () => {
             this.statusBar.ready();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-hidden-formulas", async (desc: { cmd: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-hidden-formulas", async (desc: { cmd: string }) => {
             if (this.xterm) {
                 this.xterm?.write("(show-hidden-formulas)");
                 this.xterm?.sendTextToServer("(show-hidden-formulas)");
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-expanded-sequent", async (desc: { cmd: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-expanded-sequent", async (desc: { cmd: string }) => {
             if (this.xterm) {
                 this.xterm?.write("(show-expanded-sequent)");
                 this.xterm?.sendTextToServer("(show-expanded-sequent)");
             }
         }));
-        context.subscriptions.push(commands.registerCommand("xterm-pvs.send-command", async (desc: { cmd: string }) => {
+        context.subscriptions.push(this.registerCommand("xterm-pvs.send-command", async (desc: { cmd: string }) => {
             if (this.xterm && desc?.cmd?.trim()) {
                 if (this.uiDebouncer) {
                     // do nothing - this prevents double clicks on the widget
@@ -938,20 +1533,20 @@ export class EventsDispatcher {
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.interrupt-and-quit-prover", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.interrupt-and-quit-prover", async () => {
             // ask the user confirmation before restarting pvs
             const action: ProofExecInterruptAndQuitProver = { action: "interrupt-and-quit-prover" };
             this.client.sendRequest(serverRequest.proverCommand, action);
             this.statusBar.ready();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.download-nasalib", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.download-nasalib", async () => {
             this.statusBar.hideDownloadNasalibButton();
             const success: boolean = await this.packageManager.nasalibInstallationWizard();
             if (success) {
                 this.statusBar.hideDownloadNasalibButton();
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.report-issue", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.report-issue", async () => {
             this.client.outputChannel.show(false);
             await vscode.commands.executeCommand("workbench.action.output.toggleOutput", true);
             await vscode.commands.executeCommand("workbench.action.openActiveLogOutputFile");
@@ -1011,7 +1606,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.install-pvs", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.install-pvs", async () => {
             this.statusBar.hideinstallpvsButton();
             const success: boolean = await this.packageManager.pvsInstallationWizard();
             if (!success) {
@@ -1029,7 +1624,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         //         // window.showInformationMessage(`${desc.cmd} sent to terminal`)
         //     }
         // }));
-        context.subscriptions.push(commands.registerCommand("proof-mate.proof-command-dblclicked", (desc: PvsProofCommand) => {
+        context.subscriptions.push(this.registerCommand("proof-mate.proof-command-dblclicked", (desc: PvsProofCommand) => {
             if (desc?.cmd) {
                 this.xterm.sendText(desc.cmd);
                 this.xterm.focus();
@@ -1037,7 +1632,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 // window.showInformationMessage(`${desc.cmd} sent to terminal`)
             }
         }));
-        context.subscriptions.push(commands.registerCommand("proof-explorer.proof-command-dblclicked", (desc: PvsProofCommand) => {
+        context.subscriptions.push(this.registerCommand("proof-explorer.proof-command-dblclicked", (desc: PvsProofCommand) => {
             if (desc?.cmd) {
                 this.xterm.sendText(desc.cmd);
                 this.xterm.focus();
@@ -1045,11 +1640,11 @@ Disclaimer: the logs could contain information about the system, such as name of
                 // window.showInformationMessage(`${desc.cmd} sent to terminal`)
             }
         }));
-        context.subscriptions.push(commands.registerCommand("xterm-pvs.focus", () => {
+        context.subscriptions.push(this.registerCommand("xterm-pvs.focus", () => {
             this.xterm.focus();
         }));
 
-        context.subscriptions.push(commands.registerCommand("proof-mate.update-sketchpad", (desc: { items: ProofItem[], running?: boolean }) => {
+        context.subscriptions.push(this.registerCommand("proof-mate.update-sketchpad", (desc: { items: ProofItem[], running?: boolean }) => {
             if (desc) {
                 const formulaName: string = this.proofExplorer.getFormulaName();
                 const label: string = formulaName ? `${new Date().toLocaleString()} ${formulaName}` : `${new Date().toLocaleString()}`;
@@ -1063,17 +1658,17 @@ Disclaimer: the logs could contain information about the system, such as name of
             }
         }));
 
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.print-warning-message-in-terminal", (desc: { fileName: string, fileExtension: string, contextFolder: string, theoryName: string, formulaName: string, cmd: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.print-warning-message-in-terminal", (desc: { fileName: string, fileExtension: string, contextFolder: string, theoryName: string, formulaName: string, cmd: string }) => {
             // TODO
             // this.vscodePvsTerminal.printWarningMessage(desc);
         }));
 
         // vscode-pvs.metax
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.metax", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.metax", () => {
             this.emacsBindings.metaxPrompt();
         }));
 
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.ctrlU", () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.ctrlU", () => {
             this.emacsBindings.metaxPrompt(true);
         }));
 
@@ -1090,7 +1685,7 @@ Disclaimer: the logs could contain information about the system, such as name of
         // desc.formulaName = desc.theoryName ? fsUtils.findFormulaName(info.content, info.line) : null;
 
         // vscode-pvs.show-prooflite
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-prooflite", async (resource: string | { path: string } | { contextValue: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-prooflite", async (resource: string | { path: string } | { contextValue: string }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
             if (!resource && activeEditor?.document?.fileName) {
                 resource = { path: activeEditor.document.fileName };
@@ -1176,7 +1771,7 @@ Disclaimer: the logs could contain information about the system, such as name of
             }
         }));
 
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.pvsio-web", async (resource: PvsTheory /*| { path: string }*/, opt?: { force?: boolean }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.pvsio-web", async (resource: PvsTheory /*| { path: string }*/, opt?: { force?: boolean }) => {
             let req: StartXTermEvaluatorRequest = resource && resource["theoryName"] ? <PvsTheory> resource : null;
             if (!req) {
                 const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1227,11 +1822,11 @@ Disclaimer: the logs could contain information about the system, such as name of
             }
         }));
         // pvsio-evaluator
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.pvsio-evaluator", async (theory?: PvsTheory) => {
-            await this.xterm.onStartEvaluatorRequest(theory);
+        context.subscriptions.push(this.registerCommand("vscode-pvs.pvsio-evaluator", async (theory?: PvsTheory) => {
+            return await this.xterm.onStartEvaluatorRequest(theory);
         }));
         // io requests (pvsio, pvsio-web)
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.io", async (resource?: { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.io", async (resource?: { path: string }) => {
             // the toolbar generates invocations with resource = { path }, where path is the path of the file opened in the active editor
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
             if (activeEditor?.document) {
@@ -1258,22 +1853,22 @@ Disclaimer: the logs could contain information about the system, such as name of
                     showWarningMessage (`The pvs evaluator can only be used on .pvs files.`);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
 
         // ignore keypress
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.ignore-keypress", () => {}));
+        context.subscriptions.push(this.registerCommand("vscode-pvs.ignore-keypress", () => {}));
 
         // quick-open
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.quick-open", (desc: FollowLink) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.quick-open", (desc: FollowLink) => {
             if (desc?.fname) {
                 this.fileViewer.open(fsUtils.fname2desc(desc.fname));
                 // vscode.commands.executeCommand("workbench.action.quickOpen", desc.fname);
             }
         }));
         // prettyprint-expanded
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prettyprint-expanded", (desc: PvsFile) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prettyprint-expanded", (desc: PvsFile) => {
             if (desc?.fileName) {
                 this.client.sendRequest(serverRequest.prettyprintExpanded, { file: desc }); // async call
                 this.client.onNotification(serverRequest.prettyprintExpanded, (res: PrettyPrintExpandedResponse) => {
@@ -1285,7 +1880,7 @@ Disclaimer: the logs could contain information about the system, such as name of
             }
         }));
         // view-as-markdown
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.view-as-markdown", (desc: PvsFile) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.view-as-markdown", (desc: PvsFile) => {
             if (desc?.fileName) {
                 this.fileViewer.openAsMarkdownPreview(desc); // async call
                 // vscode.commands.executeCommand("workbench.action.quickOpen", desc.fname);
@@ -1293,17 +1888,17 @@ Disclaimer: the logs could contain information about the system, such as name of
         }));
 
         // document-theory
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.document-theory", async (desc: PvsTheory) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.document-theory", async (desc: PvsTheory) => {
             commands.executeCommand('vscode-pvs.pvs-doc', desc);
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.pvs-doc", async (desc: PvsTheory) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.pvs-doc", async (desc: PvsTheory) => {
             if (desc?.theoryName) {
                 this.fileViewer.pvsDocInteractive(desc); // async call
             }
         }));
 
         // evaluate expression and open
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.open-path-expression", async (resource: {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.open-path-expression", async (resource: {
             path: string, expr: string
         }) => {
             const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
@@ -1333,16 +1928,16 @@ Disclaimer: the logs could contain information about the system, such as name of
                         vscodeUtils.showErrorMessage(`Error while trying to invoke open-path-expression (could not identify theory name, please check that the file typechecks correctly)`);
                     }
                 } else {
-                    console.error("[vscode-events-dispatcher] Error: open-path-expression invoked over an unknown resource", resource);
+                    this.logError("[vscode-events-dispatcher] Error: open-path-expression invoked over an unknown resource", resource);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: open-path-expression invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: open-path-expression invoked with null resource", resource);
             }
         }));
 
 
         // pvsio-plot
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.plot-expression", async (resource: string | {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.plot-expression", async (resource: string | {
             path: string, expr?: string
         } | {
             contextValue: string
@@ -1390,15 +1985,15 @@ Disclaimer: the logs could contain information about the system, such as name of
                         vscodeUtils.showErrorMessage(`Error while trying to invoke PVSio (could not identify theory name, please check that the file typechecks correctly)`);
                     }
                 } else {
-                    console.error("[vscode-events-dispatcher] Error: pvsio-evaluator invoked over an unknown resource", resource);
+                    this.logError("[vscode-events-dispatcher] Error: pvsio-evaluator invoked over an unknown resource", resource);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: pvsio-evaluator invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: pvsio-evaluator invoked with null resource", resource);
             }
         }));
 
         // vscode-pvs.jprove-formula
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.jprove-formula", async (desc: {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.jprove-formula", async (desc: {
             contextFolder: string,
             fileName: string,
             fileExtension: string,
@@ -1421,22 +2016,22 @@ Disclaimer: the logs could contain information about the system, such as name of
                 this.statusBar.showProgress(`Starting J-PRF proof for ${desc.formulaName}`);
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.copy-prooflite", async (req: CopyProofliteRequest) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.copy-prooflite", async (req: CopyProofliteRequest) => {
             if (req?.prooflite && req?.formulaName) {
                 // copy prooflite script to system clipboard
                 vscodeUtils.copyToClipboard(utils.commentProofliteScript(req.prooflite), { msg: `Prooflite ${req.formulaName} copied to clipboard`, useDialog: true });
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-formula-at-cursor-position", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-formula-at-cursor-position", async () => {
             this.proofExplorer.proveFormulaAtCursorPosition();
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-formula", async (req: ProveFormulaRequest) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-formula", async (req: ProveFormulaRequest): Promise<boolean> => {
             // check if proofExplorer is already open with another proof
             if (this.proofExplorer?.proofIsDirty()) {
                 // ask if the proof needs to be saved
                 const yesNoCancel: YesNoCancel = await this.proofExplorer?.queryQuitProofAndSave();
                 if (yesNoCancel === "cancel") {
-                    return;
+                    return false;
                 }
             }
             this.proofExplorer.resetView();
@@ -1447,13 +2042,14 @@ Disclaimer: the logs could contain information about the system, such as name of
                 this.proofExplorer.disposeView();
                 this.proofMate.disposeView();
             }
+            return success;
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.status-proofchain", async (req: PvsFormula) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.status-proofchain", async (req: PvsFormula) => {
             if (req && req.theoryName && req.formulaName && req.fileName && req.fileExtension) {
                 await this.workspaceExplorer.statusProofChain(req);
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.show-proof-summary", async (resource: TheoryItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.show-proof-summary", async (resource: TheoryItem | { path: string }) => {
             const desc: PvsTheory = await vscodeUtils.getPvsTheory(resource);
             if (desc && desc.theoryName) {
                 await this.workspaceExplorer.showProofSummary(desc);
@@ -1468,48 +2064,46 @@ Disclaimer: the logs could contain information about the system, such as name of
         //      3.2 loadProofDescriptor
         //      3.3 proveFormula
         // <loop over all theorems>
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-theory-inline", async (resource: TheoryItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-theory-inline", async (resource: TheoryItem | { path: string }) => {
             commands.executeCommand("vscode-pvs.prove-theory", resource);
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.jprove-theory", async (resource: TheoryItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.jprove-theory", async (resource: TheoryItem | { path: string }) => {
             commands.executeCommand("vscode-pvs.prove-theory", resource, { useJprf: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-theory", async (resource: TheoryItem | { path: string }, opt?: { useJprf?: boolean, unprovedOnly?: boolean }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-theory", async (
+            resource: TheoryItem | { path: string, theoryName?: string } | string,
+            opt?: { useJprf?: boolean, unprovedOnly?: boolean, force?: boolean, cancellationToken?: CancellationToken, origin?: string }
+        ) => {
+            resource = await this.resolveActiveResource(resource, { save: true });
             const desc: PvsTheory = await vscodeUtils.getPvsTheory(resource);
             if (desc && desc.theoryName) {
                 opt = opt || {};
                 // ask the user confirmation before restarting pvs
                 const yesno: string[] = [ "Yes", "Unproved Only", "No" ];
                 const msg: string = opt.useJprf ? `Re-run J-PRF proofs in theory ${desc.theoryName}?` : `Re-run all proofs in theory ${desc.theoryName}?`;
-                const ans: string = await vscode.window.showInformationMessage(msg, { modal: true }, yesno[0], yesno[1]);
+                const ans: string = opt.force ? (opt.unprovedOnly ? yesno[1] : yesno[0]) : await vscode.window.showInformationMessage(msg, { modal: true }, yesno[0], yesno[1]);
                 if (ans === yesno[0] || ans === yesno[1]) {
                     opt.unprovedOnly = ans === yesno[1];
-                    this.proofMate.disableView();
-                    this.proofExplorer.disableView();
-                    this.xterm.bye();
-
-                    const msg: string = (opt.unprovedOnly) ?
+                    const progressMsg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved J-PRF proofs (theory ${desc.theoryName})` : `Running unproved proofs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running J-PRF proofs (theory ${desc.theoryName})` : `Re-running proofs in theory ${desc.theoryName}`;
-                    this.statusBar.showProgress(msg);
-
-                    try{
-                        await this.workspaceExplorer.proveTheoryWithProgress(desc, opt);
-                        this.statusBar.ready();
-                        this.quietMode = false;
-                    } catch (error) {
-
-                    }
-
+                    return await this.executeTheoryProof(desc, {
+                        tccsOnly: false,
+                        useJprf: opt.useJprf,
+                        unprovedOnly: opt.unprovedOnly,
+                        progressMsg,
+                        cancellationToken: opt.cancellationToken
+                    });
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: vscode-pvs.prove-theory invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: vscode-pvs.prove-theory invoked with null resource", resource);
             }
+            return null;
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.jprove-importchain", async (resource: TheoryItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.jprove-importchain", async (resource: TheoryItem | { path: string }) => {
             commands.executeCommand("vscode-pvs.prove-importchain", resource, { useJprf: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-importchain", async (resource: TheoryItem | { path: string }, opt?: { useJprf?: boolean }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-importchain", async (resource: TheoryItem | { path: string }, opt?: { useJprf?: boolean }) => {
             const desc: PvsTheory = await vscodeUtils.getPvsTheory(resource);
             if (desc && desc.theoryName) {
                 opt = opt || {};
@@ -1533,22 +2127,15 @@ Disclaimer: the logs could contain information about the system, such as name of
                     } catch { }
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: vscode-pvs.prove-importchain invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: vscode-pvs.prove-importchain invoked with null resource", resource);
             }
         }));
         // this request comes from the context menu displayed by the editor
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.discharge-tccs", async (
-            resource: FormulaItem | TheoryItem | { path: string },
-            opt?: { useJprf?: boolean, unprovedOnly?: boolean }
+        context.subscriptions.push(this.registerCommand("vscode-pvs.discharge-tccs", async (
+            resource: FormulaItem | TheoryItem | { path: string, theoryName?: string } | string,
+            opt?: { useJprf?: boolean, unprovedOnly?: boolean, force?: boolean, formulaName?: string, match?: RegExp }
         ) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-                if (!resource) {
-                    resource = { path: activeEditor.document.fileName };
-                }
-            }
+            resource = await this.resolveActiveResource(resource, { save: true });
 
             const desc: PvsTheory = await vscodeUtils.getPvsTheory(resource);
             if (desc?.theoryName) {
@@ -1556,46 +2143,30 @@ Disclaimer: the logs could contain information about the system, such as name of
                 // ask the user confirmation before discharging
                 const msg: string = opt.useJprf ? `Discharge TCCs using J-PRF?` : `Discharge all TCCs?`;
                 const yesno: string[] = [ "Yes", "Unproved Only", "No" ];
-                const ans: string = await vscode.window.showInformationMessage(msg, { modal: true }, yesno[0], yesno[1]);
+                const ans: string = opt.force ? (opt.unprovedOnly ? yesno[1] : yesno[0]) : await vscode.window.showInformationMessage(msg, { modal: true }, yesno[0], yesno[1]);
                 if (ans === yesno[0] || ans === yesno[1]) {
                     opt.unprovedOnly = ans === yesno[1];
-                    this.quietMode = true;
-                    this.proofMate.disableView();
-                    this.proofExplorer.disableView();
-                    this.xterm.bye();
-                    // compose feedback message
-                    const msg: string = (opt.unprovedOnly) ?
+                    const progressMsg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved J-PRF TCCs (theory ${desc.theoryName})` : `Running unproved TCCs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running J-PRF TCCs (theory ${desc.theoryName})` : `Re-running TCCs in theory ${desc.theoryName}`;
-                    this.statusBar.showProgress(msg);
-                    // prove with progress
-                    await this.workspaceExplorer.proveTheoryWithProgress(desc, {
-                        tccsOnly: true,
+                    return await this.executeDischargeTccs(desc, {
                         useJprf: opt.useJprf,
-                        unprovedOnly: opt.unprovedOnly
+                        unprovedOnly: opt.unprovedOnly,
+                        match: opt.match || (opt.formulaName ? new RegExp(`${opt.formulaName}_TCC`, "g") : null),
+                        progressMsg
                     });
-                    // clear status bar
-                    this.statusBar.clear();
-                    this.statusBar.ready();
-                    this.quietMode = false;
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: vscode-pvs.discharge-tccs invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: vscode-pvs.discharge-tccs invoked with null resource", resource);
             }
+            return null;
         }));
         // this request comes from the codelens in the .tccs file
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.discharge-matching-tccs", async (
+        context.subscriptions.push(this.registerCommand("vscode-pvs.discharge-matching-tccs", async (
             resource: PvsFormula | { path: string },
-            opt?: { useJprf?: boolean, unprovedOnly?: boolean }
+            opt?: { useJprf?: boolean, unprovedOnly?: boolean, force?: boolean }
         ) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-                if (!resource) {
-                    resource = { path: activeEditor.document.fileName };
-                }
-            }
+            resource = await this.resolveActiveResource(resource, { save: true });
             const desc: PvsTheory = await vscodeUtils.getPvsTheory(resource);
             const formulaName: string = (<{ formulaName: string }>resource)["formulaName"]?.split("_TCC")[0];
             if (desc?.theoryName && formulaName) {
@@ -1603,57 +2174,40 @@ Disclaimer: the logs could contain information about the system, such as name of
                 // ask the user confirmation before discharging
                 const yesno: string[] = [ `Match ${formulaName}`, "All TCCs", "No" ];
                 const msg: string = opt.useJprf ? `Discharge TCCs using J-PRF?` : `Discharge TCCs?`;
-                const ans: string = await vscode.window.showInformationMessage(msg, { modal: true, detail: "Press 'Esc' to Cancel" }, yesno[0], yesno[1]);
+                const ans: string = opt.force ? yesno[0] : await vscode.window.showInformationMessage(msg, { modal: true, detail: "Press 'Esc' to Cancel" }, yesno[0], yesno[1]);
                 if (ans === yesno[0] || ans === yesno[1]) {
                     const allTccs: boolean = ans === yesno[1];
-                    this.quietMode = true;
-                    this.proofMate.disableView();
-                    this.proofExplorer.disableView();
-                    this.xterm.bye();
-                    // compose feedback message
-                    const msg: string = (opt.unprovedOnly) ?
+                    const progressMsg: string = (opt.unprovedOnly) ?
                         opt.useJprf ? `Running unproved ${allTccs ? "" : formulaName + " "}J-PRF TCCs (theory ${desc.theoryName})` : `Running unproved ${allTccs ? "" : formulaName + " "} TCCs in theory ${desc.theoryName}`
                             : opt.useJprf ? `Re-running ${allTccs ? "" : formulaName + " "}J-PRF TCCs (theory ${desc.theoryName})` : `Re-running ${allTccs ? "" : formulaName + " "}TCCs in theory ${desc.theoryName}`;
-                    this.statusBar.showProgress(msg);
-                    // prove with progress
-                    await this.workspaceExplorer.proveTheoryWithProgress(desc, {
-                        tccsOnly: true,
+                    return await this.executeDischargeTccs(desc, {
                         useJprf: opt.useJprf,
                         unprovedOnly: opt.unprovedOnly,
-                        match: formulaName && !allTccs ? new RegExp(`${formulaName}_TCC`, "g") : null
+                        match: formulaName && !allTccs ? new RegExp(`${formulaName}_TCC`, "g") : null,
+                        progressMsg
                     });
-                    // clear status bar
-                    this.statusBar.clear();
-                    this.statusBar.ready();
-                    this.quietMode = false;
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: vscode-pvs.discharge-matching-tccs invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: vscode-pvs.discharge-matching-tccs invoked with null resource", resource);
             }
+            return null;
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.jdischarge-tccs", async (resource: TheoryItem | { path: string }) => {
-            commands.executeCommand("vscode-pvs.discharge-tccs", resource, { useJprf: true });
+        context.subscriptions.push(this.registerCommand("vscode-pvs.jdischarge-tccs", async (resource: TheoryItem | { path: string }) => {
+            return await commands.executeCommand("vscode-pvs.discharge-tccs", resource, { useJprf: true });
         }));
         // this request comes from workspace explorer
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.discharge-tccs-explorer", async (resource: TccsOverviewItem) => {
-            commands.executeCommand("vscode-pvs.discharge-tccs", resource);
+        context.subscriptions.push(this.registerCommand("vscode-pvs.discharge-tccs-explorer", async (resource: TccsOverviewItem) => {
+            return await commands.executeCommand("vscode-pvs.discharge-tccs", resource);
         }));
 
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-workspace-inline", async (resource: WorkspaceOverviewItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-workspace-inline", async (resource: WorkspaceOverviewItem | { path: string }) => {
             commands.executeCommand("vscode-pvs.prove-workspace", resource);
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.jprove-workspace", async (resource: WorkspaceOverviewItem | { path: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.jprove-workspace", async (resource: WorkspaceOverviewItem | { path: string }) => {
             commands.executeCommand("vscode-pvs.prove-workspace", resource, { useJprf: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.prove-workspace", async (resource: WorkspaceOverviewItem | { path: string }, opt?: { useJprf?: boolean, unprovedOnly?: boolean }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-                if (!resource) {
-                    resource = { path: activeEditor.document.fileName };
-                }
-            }
+        context.subscriptions.push(this.registerCommand("vscode-pvs.prove-workspace", async (resource: WorkspaceOverviewItem | { path: string }, opt?: { useJprf?: boolean, unprovedOnly?: boolean }) => {
+            resource = await this.resolveActiveResource(resource, { save: true });
 
             const desc: ContextFolder = await vscodeUtils.getPvsWorkspace(resource);
             if (desc && desc.contextFolder) {
@@ -1679,11 +2233,11 @@ Disclaimer: the logs could contain information about the system, such as name of
                     }
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Error: vscode-pvs.discharge-tccs invoked with null resource", resource);
+                this.logError("[vscode-events-dispatcher] Error: vscode-pvs.prove-workspace invoked with null resource", resource);
             }
         }));
 
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.clean-bin", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.clean-bin", async () => {
             // ask the user confirmation before deleting bin files
 			const yesno: string[] = [ "Yes", "No" ];
 			const msg: string = `Delete pvsbin folder?\n\nThis action can resolve situations where pvs fails to start or execute proof commands.`;
@@ -1697,7 +2251,7 @@ Disclaimer: the logs could contain information about the system, such as name of
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.clean-tccs", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.clean-tccs", async () => {
             // ask the user confirmation before deleting bin files
 			const yesno: string[] = [ "Yes", "No" ];
 			const msg: string = `Delete .tccs files?`;
@@ -1717,15 +2271,15 @@ Disclaimer: the logs could contain information about the system, such as name of
                 }
             }
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.x-show-proof", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.x-show-proof", async () => {
             commands.executeCommand("proof-explorer.show-proof");
             // this.proofExplorer?.showWebView({ recenter: true });
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.x-prove", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.x-prove", async () => {
             commands.executeCommand("vscode-pvs.prove-formula-at-cursor-position");
             // commands.executeCommand("vscode-pvs.x-show-proof");
         }));
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.clean-all", async () => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.clean-all", async () => {
             // ask the user confirmation before deleting bin files
 			const yesno: string[] = [ "Yes", "No" ];
 			const msg: string = `Delete temporary files (.tccs and pvsbin) created by PVS?`;
@@ -1740,15 +2294,8 @@ Disclaimer: the logs could contain information about the system, such as name of
             }
         }));
         // vscode-pvs.typecheck-file
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.typecheck-file", async (resource: string | { path: string } | { contextValue: string } | PvsFile | TypeCheckFileRequest) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-                if (!resource) {
-                    resource = { path: activeEditor.document.fileName };
-                }
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.typecheck-file", async (resource: string | { path: string } | { contextValue: string } | PvsFile | TypeCheckFileRequest) => {
+            resource = await this.resolveActiveResource(resource, { save: true });
 			if (resource) {
                 const requestParam: TypeCheckFileRequest = {
                     file: vscodeUtils.resource2fileDescriptor
@@ -1765,20 +2312,17 @@ Disclaimer: the logs could contain information about the system, such as name of
                     showWarningMessage (`Typechecking can only be performed on .pvs files.`);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
         // alias for vscode-pvs.typecheck-file
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.typecheck-file-inline", async (resource: string | { path: string } | { contextValue: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.typecheck-file-inline", async (resource: string | { path: string } | { contextValue: string }) => {
             commands.executeCommand("vscode-pvs.typecheck-file", resource);
         }));
 
         // vscode-pvs.dump-pvs-files
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.dump-pvs-files", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.dump-pvs-files", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 const pvsFile: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (isPvsFile(pvsFile)) {
@@ -1801,15 +2345,12 @@ Disclaimer: the logs could contain information about the system, such as name of
                     });
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
         // vscode-pvs.undump-pvs-files
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.undump-pvs-files", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.undump-pvs-files", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 const dmpFile: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (isDumpFile(dmpFile)) {
@@ -1840,16 +2381,13 @@ Disclaimer: the logs could contain information about the system, such as name of
                     vscodeUtils.showWarningMessage(`Undump can only be performed on .dmp files`);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
 
         // vscode-pvs.show-tccs
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.show-tccs", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.show-tccs", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1857,19 +2395,16 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.showTccs, desc);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
         // alias for vscode-pvs.show-tccs
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.show-tccs-alt", async (resource: string | { path: string } | { contextValue: string }) => {
+		context.subscriptions.push(this.registerCommand("vscode-pvs.show-tccs-alt", async (resource: string | { path: string } | { contextValue: string }) => {
             commands.executeCommand("vscode-pvs.show-tccs", resource);
         }));
         // vscode-pvs.generate-tccs
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.generate-tccs", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.generate-tccs", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1890,16 +2425,13 @@ Disclaimer: the logs could contain information about the system, such as name of
                     });
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
 
         // vscode-pvs.parse-file
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.parse-file", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.parse-file", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1907,16 +2439,13 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.parseFileWithFeedback, desc);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
 
         // vscode-pvs.parse-workspace
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.parse-workspace", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.parse-workspace", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 let desc = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1924,19 +2453,16 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.parseWorkspaceWithFeedback, desc);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
 		}));
 
         // vscode-pvs.typecheck-workspace
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.typecheck-workspace-inline", async (resource: string | { path: string } | { contextValue: string }) => {
+        context.subscriptions.push(this.registerCommand("vscode-pvs.typecheck-workspace-inline", async (resource: string | { path: string } | { contextValue: string }) => {
             commands.executeCommand("vscode-pvs.typecheck-workspace", resource);
         }));
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.typecheck-workspace", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.typecheck-workspace", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 let desc = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1944,16 +2470,13 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.typecheckWorkspaceWithFeedback, desc);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
 
         // vscode-pvs.hp2pvs
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.hp2pvs", async (resource: string | { path: string } | { contextValue: string }) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (!resource && activeEditor?.document) {
-                resource = { path: activeEditor.document.fileName };
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.hp2pvs", async (resource: string | { path: string } | { contextValue: string }) => {
+            resource = await this.resolveActiveResource(resource);
 			if (resource) {
                 let desc = vscodeUtils.resource2fileDescriptor(resource);
                 if (desc) {
@@ -1961,20 +2484,13 @@ Disclaimer: the logs could contain information about the system, such as name of
                     this.client.sendRequest(serverRequest.hp2pvs, desc);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
 		}));
 
         // vscode-pvs.latex-file
-		context.subscriptions.push(commands.registerCommand("vscode-pvs.latex-file", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-                if (!resource) {
-                    resource = { path: activeEditor.document.fileName };
-                }
-            }
+		context.subscriptions.push(this.registerCommand("vscode-pvs.latex-file", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
+            resource = await this.resolveActiveResource(resource, { save: true });
 			if (resource) {
                 const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor(resource);
                 if (isPvsFile(desc)) {
@@ -1984,66 +2500,16 @@ Disclaimer: the logs could contain information about the system, such as name of
                     showWarningMessage (`Tried to latexify a non 'pvs' file.`);
                 }
             } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
+                this.logError("[vscode-events-dispatcher] Warning: resource is null", resource);
             }
         }));
         // vscode-pvs.latex-theory
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.latex-theory", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-
-                const fname: string = activeEditor.document.fileName;
-                const cursorPosition: vscode.Position = activeEditor.selection?.active;
-                const text: string = activeEditor.document.getText();
-
-                const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor({
-                                theoryName: findTheoryName(text, cursorPosition.line),
-                                formulaName: null,
-                                fileName: fsUtils.getFileName(fname),
-                                fileExtension: fsUtils.getFileExtension(fname),
-                                contextFolder: fsUtils.getContextFolder(fname)
-                            });
-
-                if (isPvsFile(desc)) {
-                    // send request to pvs-server
-                    this.client.sendRequest(serverRequest.latexTheory, desc);
-                } else {
-                    showWarningMessage (`Tried to latexify a non 'pvs' file.`);
-                }
-            } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
-            }
+        context.subscriptions.push(this.registerCommand("vscode-pvs.latex-theory", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
+            await this.sendActiveEditorLatexRequest(serverRequest.latexTheory, resource);
         }));
         // vscode-pvs.latex-importchain
-        context.subscriptions.push(commands.registerCommand("vscode-pvs.latex-importchain", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
-            const activeEditor: vscode.TextEditor = vscodeUtils.getActivePvsEditor();
-            if (activeEditor?.document) {
-                // if the file is currently open in the editor, save file first
-                await activeEditor.document.save();
-
-                const fname: string = activeEditor.document.fileName;
-                const cursorPosition: vscode.Position = activeEditor.selection?.active;
-                const text: string = activeEditor.document.getText();
-
-                const desc: FileDescriptor = vscodeUtils.resource2fileDescriptor({
-                                theoryName: findTheoryName(text, cursorPosition.line),
-                                formulaName: null,
-                                fileName: fsUtils.getFileName(fname),
-                                fileExtension: fsUtils.getFileExtension(fname),
-                                contextFolder: fsUtils.getContextFolder(fname)
-                            });
-
-                if (isPvsFile(desc)) {
-                    // send request to pvs-server
-                    this.client.sendRequest(serverRequest.latexImportchain, desc);
-                } else {
-                    showWarningMessage (`Tried to latexify a non 'pvs' file.`);
-                }
-            } else {
-                console.error("[vscode-events-dispatcher] Warning: resource is null", resource);
-            }
+        context.subscriptions.push(this.registerCommand("vscode-pvs.latex-importchain", async (resource: string | { path: string } | { contextValue: string } | PvsFile) => {
+            await this.sendActiveEditorLatexRequest(serverRequest.latexImportchain, resource);
         }));
 
         //----------------------------------
@@ -2188,6 +2654,14 @@ Disclaimer: the logs could contain information about the system, such as name of
 
         this.client.onNotification("pvs-error", (msg: string) => {
             if (msg) {
+                this.logger.logEvent({
+                    actor: "server",
+                    source: "eventsDispatcher",
+                    event: "server.notification",
+                    action: "pvs-error",
+                    level: "error",
+                    message: msg
+                });
                 vscodeUtils.showErrorMessage(msg);
             }
         });
@@ -2213,6 +2687,14 @@ Disclaimer: the logs could contain information about the system, such as name of
         });
 
         this.client.onNotification("server.status.pvs-failure", (params) => {
+            this.logger.logEvent({
+                actor: "server",
+                source: "eventsDispatcher",
+                event: "server.notification",
+                action: "server.status.pvs-failure",
+                level: "error",
+                data: this.sanitizeLogValue(params)
+            });
             if (this.workspaceExplorer.pvsFailureHandler) this.workspaceExplorer.pvsFailureHandler(params);
             for(const handler of this.pvsFailureHandlers){ handler(params)};
         });

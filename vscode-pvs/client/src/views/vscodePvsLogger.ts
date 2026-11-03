@@ -37,11 +37,122 @@
  **/
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as fsUtils from '../common/fsUtils';
+
+export type PvsLogActor = "user" | "mcp" | "server" | "system";
+
+export interface PvsLogEntry {
+    timestamp: string;
+    localTimestamp: string;
+    sessionId: string;
+    actor: PvsLogActor;
+    source: string;
+    event: string;
+    action?: string;
+    level?: "info" | "warn" | "error" | "debug";
+    message?: string;
+    data?: any;
+}
 
 export class VSCodePvsLogger {
     protected profiler: vscode.OutputChannel;
+    protected readonly logFolder: string;
+    protected readonly sessionId: string;
 
-    activate (context: vscode.ExtensionContext): void { }
+    constructor () {
+        this.logFolder = path.join(fsUtils.HOME_DIR, ".pvslog");
+        this.sessionId = `session-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+        this.ensureLogFolder();
+    }
+
+    protected ensureLogFolder (): void {
+        try {
+            if (!fs.existsSync(this.logFolder)) {
+                fs.mkdirSync(this.logFolder, { recursive: true });
+            }
+        } catch (err) {
+            // Avoid crashing extension if home folder is not writable
+        }
+    }
+
+    public getLogFilePath (): string {
+        const now = new Date();
+        const yyyy = now.getFullYear();
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const dd = String(now.getDate()).padStart(2, '0');
+        return path.join(this.logFolder, `vscode-pvs-events-${yyyy}-${mm}-${dd}.jsonl`);
+    }
+
+    public getSessionId (): string {
+        return this.sessionId;
+    }
+
+    activate (context: vscode.ExtensionContext): void {
+        this.ensureLogFolder();
+        this.logEvent({
+            actor: "system",
+            source: "vscodePvsLogger",
+            event: "session.start",
+            action: "activate",
+            message: `[vscodePvsLogger] Activated JSONL event logger in ${this.getLogFilePath()}`
+        });
+    }
+
+    public logEvent (entry: Omit<PvsLogEntry, "timestamp" | "localTimestamp" | "sessionId">): void {
+        try {
+            this.ensureLogFolder();
+            const record: PvsLogEntry = {
+                timestamp: new Date().toISOString(),
+                localTimestamp: fsUtils.generateTimestamp(),
+                sessionId: this.sessionId,
+                ...entry
+            };
+            const line = JSON.stringify(record) + "\n";
+            fs.appendFileSync(this.getLogFilePath(), line, { encoding: "utf8" });
+        } catch (err) {
+            // Never disrupt prover/extension workflow on logging error
+        }
+    }
+
+    public logConsole (
+        message: string,
+        meta?: Partial<Omit<PvsLogEntry, "timestamp" | "localTimestamp" | "sessionId" | "message">>
+    ): void {
+        console.log(message);
+        this.logEvent({
+            actor: meta?.actor || "system",
+            source: meta?.source || "eventsDispatcher",
+            event: meta?.event || "console.log",
+            action: meta?.action,
+            message,
+            data: meta?.data
+        });
+    }
+
+    public logError (
+        message: string,
+        error?: any,
+        meta?: Partial<Omit<PvsLogEntry, "timestamp" | "localTimestamp" | "sessionId" | "message">>
+    ): void {
+        if (error !== undefined) {
+            console.error(message, error);
+        } else {
+            console.error(message);
+        }
+        const serializedError = error instanceof Error
+            ? { name: error.name, message: error.message, stack: error.stack }
+            : error;
+        this.logEvent({
+            actor: meta?.actor || "system",
+            source: meta?.source || "eventsDispatcher",
+            event: meta?.event || "console.error",
+            action: meta?.action,
+            message,
+            data: meta?.data !== undefined ? { ...meta.data, error: serializedError } : (serializedError !== undefined ? { error: serializedError } : undefined)
+        });
+    }
     
     profilerData (data: string): void {
         const showProfilerOutput: boolean = vscode.workspace.getConfiguration().get("pvs.xtras.enableProfiler");
@@ -54,5 +165,11 @@ export class VSCodePvsLogger {
         } else {
             this.profiler?.hide();
         }
+        this.logEvent({
+            actor: "server",
+            source: "profiler",
+            event: "profiler.data",
+            data
+        });
     }
 }

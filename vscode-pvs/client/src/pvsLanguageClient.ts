@@ -2,8 +2,8 @@
  * @module PvsLanguageClient
  * @author Paolo Masci
  * @date 2019.06.18
- * @copyright 
- * Copyright 2019 United States Government as represented by the Administrator 
+ * @copyright
+ * Copyright 2019 United States Government as represented by the Administrator
  * of the National Aeronautics and Space Administration. All Rights Reserved.
  *
  * Disclaimers
@@ -36,8 +36,8 @@
  * TERMINATION OF THIS AGREEMENT.
  **/
 import * as path from 'path';
-import { 
-	TextDocument, window, workspace, ExtensionContext, TextEditor, TextDocumentChangeEvent, 
+import {
+	TextDocument, window, workspace, ExtensionContext, TextEditor, TextDocumentChangeEvent,
 	commands, ConfigurationChangeEvent, Uri, FileRenameEvent, WindowState, env,
 	FileSystemWatcher
 } from 'vscode';
@@ -148,10 +148,10 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 
 	/**
 	 * Internal function, autosaves pvs files with frequency AUTOSAVE_INTERVAL
-	 * @param document 
+	 * @param document
 	 */
 	protected autosave (document: TextDocument) {
-		// cancel any previously scheduled save 
+		// cancel any previously scheduled save
 		if (this.timers['autosave']) {
 			clearTimeout(this.timers['autosave']);
 			this.timers['autosave'] = null;
@@ -168,7 +168,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 	 * Internal function, defines handlers for document events
 	 */
 	protected registerTextEditorHandlers () {
-		
+
 		// onDidOpenTextDocument is emitted when a text file is opened in the editor or when the language id of a text document has changed.
 		workspace.onDidOpenTextDocument(async (event: TextDocument) => {
 			const editor: TextEditor = getActivePvsEditor();
@@ -188,7 +188,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 						this.workspaceExplorer.setMode(theoriesFromActiveFile ? WorkspaceMode.theoriesFromActiveFile : WorkspaceMode.theoriesFromActiveContext);
 						this.workspaceExplorer.setActivePvsFile(fname);
 						// don't update file explorer, as any modification will create an Untitled workspace, which might be problematic for vscode-pvs users
-						// because users will be asked to save the workspace on exit, and if they choose to save the workspace, 
+						// because users will be asked to save the workspace on exit, and if they choose to save the workspace,
 						// they will also be asked whether they want to open the workspace configuration next time they will work on that folder
 						// const contextFolderUri: Uri = Uri.file(contextFolder);
 						// if (!workspace.getWorkspaceFolder(contextFolderUri)) {
@@ -268,7 +268,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 		}, null, this.context.subscriptions);
 
 		// onDidChangeConfiguration is emitted when the configuration file changes
-		workspace.onDidChangeConfiguration( async (event: ConfigurationChangeEvent) => {			
+		workspace.onDidChangeConfiguration( async (event: ConfigurationChangeEvent) => {
 			// get color theme
 			const colorTheme: XTermColorTheme = vscodeUtils.detectColorTheme();
 			this.xterm.updateColorTheme(colorTheme);
@@ -317,20 +317,20 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 					this.statusBar.showProgress(msg);
 					// window.showInformationMessage(msg);
 					this.client.sendRequest(serverRequest.startPvsServer, {
-						pvsPath: this.pvsPath, 
-						pvsLibraryPath: this.pvsLibraryPath, 
+						pvsPath: this.pvsPath,
+						pvsLibraryPath: this.pvsLibraryPath,
 						externalServer: vscodeUtils.getConfigurationFlag("pvs.externalServer"),
 						webSocketPort: vscodeUtils.getConfigurationValue("pvs.initialPortNumber"),
 						remote: remoteDetails
-					}); // the server will use the last context folder it was using	
+					}); // the server will use the last context folder it was using
 				} else if (remoteDetailsChanged) {
 					const msg: string = `Restarting PVS from ${this.pvsPath}`;
 					const remoteDetails = vscodeUtils.getRemoteDetail(this.context);
 					this.statusBar.showProgress(msg);
 					// window.showInformationMessage(msg);
 					this.client.sendRequest(serverRequest.startPvsServer, {
-						pvsPath: this.pvsPath, 
-						pvsLibraryPath: this.pvsLibraryPath, 
+						pvsPath: this.pvsPath,
+						pvsLibraryPath: this.pvsLibraryPath,
 						externalServer: vscodeUtils.getConfigurationFlag("pvs.externalServer"),
 						webSocketPort: vscodeUtils.getConfigurationValue("pvs.initialPortNumber"),
 						remote: remoteDetails
@@ -346,7 +346,7 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 
 			// update workspace explorer if needed
 			const theoriesFromActiveFile: boolean = vscodeUtils.getConfigurationFlag("pvs.pvsWorkspaceTheoriesFromActiveFile");
-			if (event.affectsConfiguration("pvs.pvsWorkspaceTheoriesFromActiveFile") 
+			if (event.affectsConfiguration("pvs.pvsWorkspaceTheoriesFromActiveFile")
 			    && theoriesFromActiveFile !== this.workspaceExplorer.theoriesFromActiveFile()) {
 				const activeEditor: TextEditor = getActivePvsEditor();//window.activeTextEditor; //event || window.activeTextEditor;
 				const fname: string =  activeEditor?.document?.fileName || this.workspaceExplorer.getActivePvsFile();
@@ -363,11 +363,11 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 				return value?.oldUri?.path?.endsWith(".pvs");
 			}) || [];
 			const activeEditor: TextEditor = getActivePvsEditor();
-			
+
 			if (pvsFiles.length > 0
-				|| (activeEditor && 
+				|| (activeEditor &&
 						(fsUtils.isPvsFile(activeEditor?.document?.fileName)
-							|| activeEditor?.document?.languageId === "Log"))) { 
+							|| activeEditor?.document?.languageId === "Log"))) {
 				// send clearWorkspace command to the server, otherwise the server will erroneously report a typecheck error because it may have cached the theory name from the old file
 				this.client.sendRequest(serverRequest.clearWorkspace);
 				// remove tccs file for the renamed file, if the file exists
@@ -423,17 +423,17 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 	}
 	/**
 	 * Client activation function.
-	 * @param context 
+	 * @param context
 	 */
 	activate (context: ExtensionContext): void {
 		// create language client
 		this.createLanguageClient(context);
-		
+
 		// create status bar
 		this.statusBar = new VSCodePvsStatusBar(this.client);
 		this.statusBar.activate(this.context);
 		this.statusBar.showProgress("Starting vscode-pvs...");
-		
+
 		// start client, which in turn will also start the server
 		this.client.start();
 		this.client.onReady().then(() => {
@@ -472,17 +472,17 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 			this.fileViewer = new VSCodePvsFileViewer(this.client);
 			this.fileViewer.activate(this.context);
 			this.pathEvaluator = new VSCodePvsPathEvaluator(this.client, this.fileViewer);
-			
+
 			this.pvsioweb = new VSCodePvsioWeb(this.client);
 			this.pvsioweb.activate(this.context);
-	
+
 			// enable decorations for pvs syntax
 			this.decorationProvider = new VSCodePvsDecorationProvider();
 			this.decorationProvider.updateDecorations(getActivePvsEditor());
-	
+
 			// register handlers for document events
 			this.registerTextEditorHandlers();
-			
+
 			// create event dispatcher for handling events for views
 			this.eventsDispatcher = new EventsDispatcher(this.client, {
 				statusBar: this.statusBar,
@@ -506,8 +506,9 @@ export class PvsLanguageClient { //implements vscode.Disposable {
 			(this.xterm as any).setEventsDispatcher(this.eventsDispatcher);
 
 			this.mcpHttpServer = new McpHttpServer(this.eventsDispatcher);
-			this.mcpHttpServer.start();
-			
+			let mcpPort = vscodeUtils.getConfigurationValue("pvs.mcpPort") || 2222;
+			this.mcpHttpServer.start(mcpPort);
+
 			// add default container file to appopriate path in globalStorage if it doesn't exist and add commands for devcontainer
 			try{
 			const remoteName = env.remoteName;
@@ -620,7 +621,7 @@ const pvsLanguageClient = new PvsLanguageClient();
  * Function activate is invoked every time a new IDE session is started. This includes:
  *  - Opening a new folder in the IDE browser
  *  - ...
- * @param context 
+ * @param context
  */
 export function activate(context: ExtensionContext) {
 	// Activate the client.

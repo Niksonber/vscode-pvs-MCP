@@ -386,7 +386,15 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
         });
         const success: boolean = await new Promise((resolve, reject) => {
             const onProveFormulaResponse = (data: ProveFormulaResponse) => {
-                console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proveFormulaResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+                const logMsg = `[${fsUtils.generateTimestamp()}] ` + `[vscodePvsXTerm] responding request ${serverEvent.proveFormulaResponse} - param: ${JSON.stringify(data)} `;
+                console.log(logMsg); // #DEBUG
+                this.eventsDispatcher?.getLogger()?.logConsole(logMsg, {
+                    actor: "server",
+                    source: "vscodePvsXTerm",
+                    event: "server.response",
+                    action: serverEvent.proveFormulaResponse,
+                    data
+                });
                 if (this.sessionType) {
                     if (this.prettyPrinter) {
                         const color: colorUtils.PvsColor = colorUtils.getColor(colorUtils.PvsColor.green, this.colorTheme);
@@ -411,7 +419,15 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
             };
 
             const onProofCommandResponse = (data: ProofCommandResponse) => {
-                console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+                const logMsg = `[${fsUtils.generateTimestamp()}] ` + `[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `;
+                console.log(logMsg); // #DEBUG
+                this.eventsDispatcher?.getLogger()?.logConsole(logMsg, {
+                    actor: "server",
+                    source: "vscodePvsXTerm",
+                    event: "server.response",
+                    action: serverEvent.proofCommandResponse,
+                    data
+                });
                 this.onProverResponse(data);
             };
 
@@ -583,7 +599,15 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
         this.client.sendRequest(serverRequest.startEvaluator, theory);
         const success: boolean = await new Promise((resolve, reject) => {
             this.client.onRequest(serverEvent.startEvaluatorResponse, (data: { response: PvsResponse, args: PvsTheory, error?: string }) => {
-              console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.startEvaluatorResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+              const logMsg = `[${fsUtils.generateTimestamp()}] ` + `[vscodePvsXTerm] responding request ${serverEvent.startEvaluatorResponse} - param: ${JSON.stringify(data)} `;
+              console.log(logMsg); // #DEBUG
+              this.eventsDispatcher?.getLogger()?.logConsole(logMsg, {
+                  actor: "server",
+                  source: "vscodePvsXTerm",
+                  event: "server.response",
+                  action: serverEvent.startEvaluatorResponse,
+                  data
+              });
                 if (data?.response) {
                     const banner: string = colorUtils.colorText(
                         (data.response.result?.version?
@@ -735,6 +759,24 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
      */
     async sendTextToServer (text: string, addNewLine?: boolean, origin: string = "xterm-pvs"): Promise<boolean> {
         this.mirror(`${this.prompt} ${text}`);
+        this.eventsDispatcher?.getLogger()?.logEvent({
+            actor: origin === "mcp-server" ? "mcp" : "user",
+            source: "vscodePvsXTerm",
+            event: "xterm.command",
+            action: this.sessionType === "prover" ? "proofCommand" : "evaluatorCommand",
+            data: {
+                command: text,
+                origin,
+                sessionType: this.sessionType,
+                target: this.target ? {
+                    contextFolder: this.target.contextFolder,
+                    fileName: this.target.fileName,
+                    fileExtension: this.target.fileExtension,
+                    theoryName: this.target.theoryName,
+                    formulaName: (this.target as PvsFormula).formulaName
+                } : undefined
+            }
+        });
         // return new Promise((resolve, reject) => {
             if (this.sessionType === "evaluator") {
                 const command: PvsioEvaluatorCommand = {
@@ -773,12 +815,29 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
     async sendEvaluatorCommand (req: PvsioEvaluatorCommand): Promise<EvaluatorCommandResponse> {
         return new Promise((resolve, reject) => {
             if (this.sessionType === "evaluator") {
-                this.client.sendRequest(serverRequest.evaluatorCommand, req);
-                this.client.onRequest(serverEvent.evaluatorCommandResponse, (data: EvaluatorCommandResponse) => {
-                  console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.evaluatorCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+                const onEvaluatorResponse = (data: EvaluatorCommandResponse) => {
+                    const logMsg = `[${fsUtils.generateTimestamp()}] ` + `[vscodePvsXTerm] responding request ${serverEvent.evaluatorCommandResponse} - param: ${JSON.stringify(data)} `;
+                    console.log(logMsg); // #DEBUG
+                    this.eventsDispatcher?.getLogger()?.logConsole(logMsg, {
+                        actor: "server",
+                        source: "vscodePvsXTerm",
+                        event: "server.response",
+                        action: serverEvent.evaluatorCommandResponse,
+                        data
+                    });
+                    if (this.eventsDispatcher) {
+                        this.eventsDispatcher.removeEvaluatorCommandResponseListener(onEvaluatorResponse);
+                    }
                     this.onEvaluatorResponse(data);
-                    resolve(data)
-                });
+                    resolve(data);
+                };
+
+                if (this.eventsDispatcher) {
+                    this.eventsDispatcher.addEvaluatorCommandResponseListener(onEvaluatorResponse);
+                } else {
+                    this.client.onRequest(serverEvent.evaluatorCommandResponse, onEvaluatorResponse);
+                }
+                this.client.sendRequest(serverRequest.evaluatorCommand, req);
             } else {
                 resolve(null);
             }
@@ -795,7 +854,15 @@ export class VSCodePvsXTerm extends Backbone.Model implements Terminal {
 				if (parens?.success) {
                     this.client.sendRequest(serverRequest.proofCommand, req);
                     const onProofCommandResponse = (data: ProofCommandResponse) => {
-                        console.log(`[${fsUtils.generateTimestamp()}] `+`[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `); // #DEBUG
+                        const logMsg = `[${fsUtils.generateTimestamp()}] ` + `[vscodePvsXTerm] responding request ${serverEvent.proofCommandResponse} - param: ${JSON.stringify(data)} `;
+                        console.log(logMsg); // #DEBUG
+                        this.eventsDispatcher?.getLogger()?.logConsole(logMsg, {
+                            actor: "server",
+                            source: "vscodePvsXTerm",
+                            event: "server.response",
+                            action: serverEvent.proofCommandResponse,
+                            data
+                        });
                         data.req = req; // copy request to make sure meta fields are preserved, e.g., 'origin', as this is needed by the prover console to show correct feedback
                         this.onProverResponse(data);
                         const success: boolean = data ?
